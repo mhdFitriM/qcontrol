@@ -31,8 +31,13 @@ const __dirname = path.dirname(__filename);
 // Configuration via env.
 const PORT = Number(process.env.PORT || 8089);
 const HOST_OPT = process.env.HOST_OPT || '/host/opt';
+// Real path on the docker host that HOST_OPT mounts. Needed when we shell
+// out to `docker run -v <path>:...` — the daemon (on the host) interprets
+// those paths, NOT the qcontrol container's view. Default is /opt.
+const HOST_OPT_REAL = process.env.HOST_OPT_REAL || '/opt';
 const TOKEN = process.env.QCONTROL_TOKEN || '';
 const REVERSE_PROXY_DIR = path.join(HOST_OPT, 'reverse-proxy');
+const REVERSE_PROXY_HOST_PATH = `${HOST_OPT_REAL.replace(/\/+$/, '')}/reverse-proxy`;
 const WEB_DIST = path.join(__dirname, '..', 'web', 'dist');
 
 if (!TOKEN) {
@@ -177,20 +182,52 @@ app.get('/api/projects', authed, async (_req, res) => {
 
 app.get('/api/projects/:name/containers', authed, async (req, res) => {
   const project = req.params.name;
+  const dir = path.join(HOST_OPT, project);
+  if (!existsSync(dir)) return res.status(404).json({ error: 'no_such_project' });
+
+  // Authoritative listing: ask compose itself, from inside the project dir,
+  // using its own compose files. This is immune to project-name mismatches
+  // (dashes vs underscores, overridden `name:` in compose.yml, etc.) that
+  // broke label-based filtering for clones like project-qbotu-a3-staging.
+  const overlay = path.join(dir, 'docker-compose.vps.yml');
+  const args = ['compose', '-f', 'docker-compose.yml'];
+  if (existsSync(overlay)) args.push('-f', 'docker-compose.vps.yml');
+  args.push('ps', '-a', '--format', 'json');
+
   try {
-    const { stdout } = await execFileP(
-      'docker',
-      ['ps', '-a', '--filter', `label=com.docker.compose.project=${project}`, '--format',
-        '{{.Names}}\t{{.Status}}\t{{.Ports}}\t{{.Image}}'],
-      { timeout: 5000 },
-    );
-    const rows = stdout.split('\n').filter(Boolean).map((line) => {
-      const [name, status, ports, image] = line.split('\t');
-      return { name, status, ports, image };
+    const { stdout } = await execFileP('docker', args, { cwd: dir, timeout: 8000, maxBuffer: 4 * 1024 * 1024 });
+    // `docker compose ps --format json` may emit either a single JSON array
+    // or NDJSON (one object per line) depending on compose version. Handle both.
+    const lines = stdout.split('\n').map((l) => l.trim()).filter(Boolean);
+    let raw = [];
+    if (lines.length === 1 && lines[0].startsWith('[')) {
+      try { raw = JSON.parse(lines[0]); } catch { raw = []; }
+    } else {
+      for (const line of lines) {
+        try { raw.push(JSON.parse(line)); } catch { /* skip malformed */ }
+      }
+    }
+    const rows = raw.map((c) => ({
+      name: c.Name || c.Names || '',
+      status: c.Status || c.State || '',
+      state: (c.State || '').toLowerCase(),  // running | exited | created | ...
+      ports: typeof c.Publishers === 'object'
+        ? (c.Publishers || []).map((p) => {
+            const host = p.URL ? `${p.URL}:${p.PublishedPort}` : (p.PublishedPort ? `:${p.PublishedPort}` : '');
+            return host ? `${host}->${p.TargetPort}/${p.Protocol || 'tcp'}` : '';
+          }).filter(Boolean).join(', ')
+        : (c.Ports || ''),
+      image: c.Image || '',
+    }));
+    const runningCount = rows.filter((r) => r.state === 'running').length;
+    res.json({
+      data: rows,
+      running: runningCount > 0,
+      total: rows.length,
+      runningCount,
     });
-    res.json({ data: rows });
   } catch (e) {
-    res.status(500).json({ error: 'docker_error', message: e.message });
+    res.status(500).json({ error: 'docker_error', message: e.stderr || e.message });
   }
 });
 
@@ -475,30 +512,13 @@ app.post('/api/projects/clone', authed, async (req, res) => {
       push('==> appended to /opt/reverse-proxy/Caddyfile');
 
       if (reloadCaddy) {
-        // IMPORTANT: Caddy reads {$VAR} env-var references ONCE at container
-        // startup, not on `caddy reload`. Since the clone just appended a
-        // brand-new *_DOMAIN / *_UPSTREAM pair to .env, a plain reload would
-        // expand them to empty strings, producing a `<empty> { ... }` block
-        // that Caddy treats as a global options block (must be first) and
-        // refuses with "server block without any key is global configuration".
-        // The reliable path is to recreate the Caddy container so it re-reads
-        // .env from disk. ~1 second of downtime; acceptable.
-        try {
-          const r = await execP(
-            'docker compose -f docker-compose.yml up -d --force-recreate caddy',
-            { cwd: REVERSE_PROXY_DIR, timeout: 60000 },
-          );
-          push('==> caddy recreated with fresh env');
-          push(r.stdout + r.stderr);
-          const v = await execP(
-            'docker compose -f docker-compose.yml exec -T caddy caddy validate --config /etc/caddy/Caddyfile',
-            { cwd: REVERSE_PROXY_DIR, timeout: 30000 },
-          );
-          push('==> caddy validate ok');
-          push(v.stdout + v.stderr);
-        } catch (e) {
-          push('✗ caddy recreate/validate failed: ' + (e.stderr || e.message));
-          push('   (.env and Caddyfile were still written — fix the syntax and rerun manually)');
+        // Pre-validates in a throw-away container BEFORE recreating, so a
+        // bad Caddyfile or empty env var can't take the running reverse-
+        // proxy down (which would dark every domain on this VPS).
+        const rec = await safeRecreateCaddy();
+        push(rec.log);
+        if (!rec.ok) {
+          push('   (.env and Caddyfile were written but Caddy was left on the OLD config — your traffic is still live)');
         }
       }
       proxyDetails = { domain, port, envKey: slug };
@@ -586,30 +606,209 @@ app.post('/api/revproxy/reload', authed, async (_req, res) => {
   }
 });
 
-app.post('/api/revproxy/recreate', authed, async (_req, res) => {
-  // Use this after editing .env (new *_DOMAIN / *_UPSTREAM vars). Caddy only
-  // re-reads its `{$VAR}` expansions at container startup, so adding a brand
-  // new var requires a recreate, not a reload. ~1 second of TLS downtime.
+/**
+ * Safely recreate the running Caddy container so it re-reads .env.
+ *
+ * The previous version did `docker compose up -d --force-recreate caddy`
+ * unconditionally, which destroyed the running container BEFORE checking
+ * whether the new .env+Caddyfile pair was valid. If it wasn't, the new
+ * container failed to start and the whole reverse-proxy went dark.
+ *
+ * The new flow validates FIRST in a throw-away container that gets the
+ * same .env (so any new `{$VAR}` expansions are exercised). Only when
+ * validation passes do we actually swap the running container. If
+ * validation fails, the running stack keeps serving traffic on its old
+ * config — no downtime, no surprise.
+ */
+async function safeRecreateCaddy() {
+  const log = [];
+
+  // Figure out which Caddy image the running stack uses, so the temp
+  // validator runs the exact same binary. Falls back to caddy:2 if we
+  // can't read the running container (e.g., it's not up yet).
+  let image = 'caddy:2';
   try {
-    const { stdout, stderr } = await execP(
+    const r = await execP(
+      'docker compose -f docker-compose.yml ps caddy --format "{{.Image}}"',
+      { cwd: REVERSE_PROXY_DIR, timeout: 5000 },
+    );
+    const first = (r.stdout || '').split('\n').map((s) => s.trim()).filter(Boolean)[0];
+    if (first) image = first;
+  } catch { /* fall back to caddy:2 */ }
+  log.push(`==> pre-validating with image ${image}`);
+
+  // Throw-away validator. Mounts the Caddyfile read-only, reads the new
+  // .env via --env-file, runs `caddy validate`. No side effects.
+  try {
+    const r = await execP(
+      `docker run --rm -v ${REVERSE_PROXY_HOST_PATH}/Caddyfile:/etc/caddy/Caddyfile:ro --env-file ${REVERSE_PROXY_HOST_PATH}/.env ${image} caddy validate --config /etc/caddy/Caddyfile`,
+      { timeout: 30000 },
+    );
+    log.push('==> pre-validation passed');
+    log.push(r.stdout + r.stderr);
+  } catch (e) {
+    log.push('✗ pre-validation FAILED — running Caddy left untouched');
+    log.push(e.stdout + e.stderr);
+    return { ok: false, error: 'pre_validate_failed', log: log.join('\n') };
+  }
+
+  // Validation passed — safe to recreate.
+  try {
+    const r = await execP(
       'docker compose -f docker-compose.yml up -d --force-recreate caddy',
       { cwd: REVERSE_PROXY_DIR, timeout: 60000 },
     );
-    // After recreate, validate to surface any non-env Caddyfile errors.
-    let validateLog = '';
-    try {
-      const v = await execP(
-        'docker compose -f docker-compose.yml exec -T caddy caddy validate --config /etc/caddy/Caddyfile',
-        { cwd: REVERSE_PROXY_DIR, timeout: 30000 },
-      );
-      validateLog = v.stdout + v.stderr;
-    } catch (e) {
-      return res.status(400).json({ ok: false, error: 'caddy_invalid_after_recreate', log: stdout + stderr + '\n' + (e.stdout + e.stderr) });
-    }
-    res.json({ ok: true, log: stdout + stderr + '\n' + validateLog });
+    log.push('==> caddy recreated with fresh env');
+    log.push(r.stdout + r.stderr);
+    return { ok: true, log: log.join('\n') };
   } catch (e) {
-    res.status(500).json({ ok: false, error: 'recreate_failed', log: (e.stdout || '') + (e.stderr || e.message) });
+    log.push('✗ recreate failed');
+    log.push((e.stdout || '') + (e.stderr || e.message));
+    return { ok: false, error: 'recreate_failed', log: log.join('\n') };
   }
+}
+
+app.post('/api/revproxy/recreate', authed, async (_req, res) => {
+  const result = await safeRecreateCaddy();
+  res.status(result.ok ? 200 : 400).json(result);
+});
+
+// ─── destroy / remove project ───────────────────────────────────────────
+
+/**
+ * Strip a project's lines from the reverse-proxy .env and its block from
+ * the Caddyfile. Returns true if anything was removed. We match by the
+ * SLUG prefix that the clone code uses (PROJECT_NAME_UPPER_WITH_UNDERSCORES).
+ */
+async function removeReverseProxyEntries(projectName) {
+  const slug = slugify(projectName).toUpperCase().replace(/-/g, '_');
+  let changed = false;
+
+  // .env: drop any line that starts with `<SLUG>_…=` plus its preceding
+  // `# <projectName>` comment if present.
+  try {
+    const envPath = path.join(REVERSE_PROXY_DIR, '.env');
+    const body = await readFile(envPath, 'utf8');
+    const lines = body.split('\n');
+    const out = [];
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const trimmed = line.trim();
+      if (trimmed === `# ${projectName}`) {
+        // Skip this comment if the next non-blank line is a SLUG line.
+        let j = i + 1;
+        while (j < lines.length && lines[j].trim() === '') j++;
+        if (j < lines.length && new RegExp(`^${slug}_[A-Z0-9_]*=`).test(lines[j].trim())) {
+          changed = true;
+          continue;
+        }
+      }
+      if (new RegExp(`^${slug}_[A-Z0-9_]*=`).test(trimmed)) { changed = true; continue; }
+      out.push(line);
+    }
+    if (changed) await writeFile(envPath, out.join('\n').replace(/\n{3,}/g, '\n\n'), 'utf8');
+  } catch { /* file missing — nothing to clean */ }
+
+  // Caddyfile: drop the block whose key references `{$<SLUG>_DOMAIN}`. We
+  // do a simple brace-balanced scan from the opening line through the
+  // matching `}`. This is robust for the simple blocks the clone writes;
+  // more elaborate user-authored blocks may need manual cleanup.
+  try {
+    const caddyPath = path.join(REVERSE_PROXY_DIR, 'Caddyfile');
+    const body = await readFile(caddyPath, 'utf8');
+    const needle = `{$${slug}_DOMAIN}`;
+    if (body.includes(needle)) {
+      const idx = body.indexOf(needle);
+      // Walk back to the start of the block's opening line.
+      let lineStart = body.lastIndexOf('\n', idx) + 1;
+      // Walk forward to the opening brace.
+      let openBrace = body.indexOf('{', idx);
+      if (openBrace !== -1) {
+        let depth = 1, cur = openBrace + 1;
+        while (depth > 0 && cur < body.length) {
+          if (body[cur] === '{') depth++;
+          else if (body[cur] === '}') depth--;
+          cur++;
+        }
+        if (depth === 0) {
+          // Eat trailing newlines that follow the closing brace.
+          while (cur < body.length && (body[cur] === '\n' || body[cur] === '\r')) cur++;
+          const newBody = (body.slice(0, lineStart) + body.slice(cur)).replace(/\n{3,}/g, '\n\n');
+          await writeFile(caddyPath, newBody, 'utf8');
+          changed = true;
+        }
+      }
+    }
+  } catch { /* file missing — nothing to clean */ }
+
+  return changed;
+}
+
+app.delete('/api/projects/:name', authed, async (req, res) => {
+  const { confirm, removeReverseProxy = true } = req.body || {};
+  const project = req.params.name;
+  const dir = path.join(HOST_OPT, project);
+
+  if (!project || confirm !== project) {
+    return res.status(400).json({ error: 'confirm_required', message: 'POST body must contain { confirm: "<project-name>" }' });
+  }
+  if (!existsSync(dir)) {
+    return res.status(404).json({ error: 'no_such_project' });
+  }
+
+  const log = [];
+  const push = (line) => log.push(line);
+
+  // 1. Bring the project's stack down (volumes + orphans removed).
+  try {
+    const overlay = path.join(dir, 'docker-compose.vps.yml');
+    const args = ['compose', '-f', 'docker-compose.yml'];
+    if (existsSync(overlay)) args.push('-f', 'docker-compose.vps.yml');
+    args.push('down', '-v', '--remove-orphans');
+    const r = await execFileP('docker', args, { cwd: dir, timeout: 5 * 60 * 1000, maxBuffer: 4 * 1024 * 1024 });
+    push('==> docker compose down -v --remove-orphans');
+    push(r.stdout + r.stderr || '(no output)');
+  } catch (e) {
+    // Don't bail — the project may already be stopped or the compose file
+    // may be broken. Just record and move on to the folder removal.
+    push('warning during docker compose down: ' + (e.stderr || e.message));
+  }
+
+  // 2. Remove the on-disk folder.
+  try {
+    const r = await execFileP('rm', ['-rf', dir], { timeout: 60_000 });
+    push(`==> rm -rf ${dir}`);
+    push(r.stdout + r.stderr || '(ok)');
+  } catch (e) {
+    push('✗ rm -rf failed: ' + (e.stderr || e.message));
+    return res.status(500).json({ ok: false, log: log.join('\n') });
+  }
+
+  // 3. Optionally strip the reverse-proxy entries.
+  let revproxyChanged = false;
+  if (removeReverseProxy) {
+    revproxyChanged = await removeReverseProxyEntries(project);
+    push(revproxyChanged
+      ? '==> removed reverse-proxy .env + Caddyfile entries'
+      : '==> no reverse-proxy entries found for this project (or nothing to remove)');
+  }
+
+  // 4. If we touched reverse-proxy, safely recreate Caddy.
+  if (revproxyChanged) {
+    const rec = await safeRecreateCaddy();
+    push('\n' + rec.log);
+    if (!rec.ok) {
+      return res.status(207).json({
+        ok: true,
+        projectRemoved: true,
+        revproxyApplied: false,
+        log: log.join('\n'),
+        warning: 'project removed and revproxy entries cleaned, but Caddy did not restart cleanly — fix the Caddyfile and run Apply .env changes',
+      });
+    }
+  }
+
+  res.json({ ok: true, projectRemoved: true, revproxyApplied: revproxyChanged, log: log.join('\n') });
 });
 
 // ─── static SPA ──────────────────────────────────────────────────────────

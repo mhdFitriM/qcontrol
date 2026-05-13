@@ -6,6 +6,9 @@ services:
     environment:
       QCONTROL_TOKEN: ${QCONTROL_TOKEN:?set in .env}
       HOST_OPT: /host/opt
+      # Real path on the docker host. We mount /opt → /host/opt below; any
+      # `docker run -v` we shell out to needs the host's view (/opt).
+      HOST_OPT_REAL: /opt
       PORT: 8089
     volumes:
       # Docker socket — qcontrol shells out to the host's docker CLI through this.

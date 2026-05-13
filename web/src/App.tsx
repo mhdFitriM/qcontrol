@@ -1,11 +1,13 @@
 import { Navigate, NavLink, Outlet, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import { useEffect, useState } from 'react';
-import { Boxes, Globe, LogOut, Menu, ServerCog, X } from 'lucide-react';
+import { Activity, BookOpen, Boxes, Globe, LogOut, Menu, ServerCog, X } from 'lucide-react';
 import { api } from './lib/api';
 import { Login } from './pages/Login';
 import { Projects } from './pages/Projects';
 import { ProjectDetail } from './pages/ProjectDetail';
 import { ReverseProxy } from './pages/ReverseProxy';
+import { VpsHealth } from './pages/VpsHealth';
+import { DocsIndex, DocsProject } from './pages/Docs';
 
 export default function App() {
   return (
@@ -13,9 +15,12 @@ export default function App() {
       <Route path="/login" element={<Login />} />
       <Route path="/" element={<RequireAuth><Shell /></RequireAuth>}>
         <Route index element={<Navigate to="/projects" replace />} />
+        <Route path="vps" element={<VpsHealth />} />
         <Route path="projects" element={<Projects />} />
         <Route path="projects/:name" element={<ProjectDetail />} />
         <Route path="revproxy" element={<ReverseProxy />} />
+        <Route path="docs" element={<DocsIndex />} />
+        <Route path="docs/:slug" element={<DocsProject />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
@@ -132,8 +137,10 @@ function SidebarNav({ onLogout }: { onLogout: () => void }) {
   return (
     <>
       <nav className="flex-1 p-3 space-y-1 overflow-y-auto">
+        <NavItem to="/vps" icon={Activity} label="VPS health" />
         <NavItem to="/projects" icon={Boxes} label="Projects" />
         <NavItem to="/revproxy" icon={Globe} label="Reverse proxy" />
+        <NavItem to="/docs" icon={BookOpen} label="Docs" />
       </nav>
       <div className="p-3 border-t border-white/10 flex-shrink-0 pb-[max(env(safe-area-inset-bottom),0.75rem)]">
         <button

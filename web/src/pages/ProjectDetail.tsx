@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
-import { ArrowLeft, Loader2, Play, RefreshCw, Square, Hammer, ScrollText, Trash2, AlertTriangle } from 'lucide-react';
+import { ArrowLeft, Loader2, Play, RefreshCw, Square, Hammer, ScrollText, Trash2, AlertTriangle, Terminal } from 'lucide-react';
 import { api } from '../lib/api';
 
 interface Container { name: string; status: string; state: string; ports: string; image: string; }
 interface ContainersResp { data: Container[]; running: boolean; total: number; runningCount: number; }
+
+type OutputTab = 'output' | 'logs';
 
 export function ProjectDetail() {
   const { name = '' } = useParams();
@@ -13,6 +15,9 @@ export function ProjectDetail() {
   const [stats, setStats] = useState<{ running: boolean; total: number; runningCount: number } | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [output, setOutput] = useState<string>('');
+  const [logs, setLogs] = useState<string>('');
+  const [logsLoading, setLogsLoading] = useState(false);
+  const [outputTab, setOutputTab] = useState<OutputTab>('output');
   const [loading, setLoading] = useState(true);
   const [removeOpen, setRemoveOpen] = useState(false);
 
@@ -22,6 +27,14 @@ export function ProjectDetail() {
       const r = await api.get<ContainersResp>(`/projects/${encodeURIComponent(name)}/containers`);
       setContainers(r.data);
       setStats({ running: r.running, total: r.total, runningCount: r.runningCount });
+      // Auto-load logs whenever the stack isn't fully up. Big help when
+      // diagnosing a "why isn't this running" situation — the user opens
+      // the page and immediately sees the failing container's last 200
+      // lines without having to click anything.
+      if (r.total > 0 && r.runningCount < r.total) {
+        void loadLogs();
+        setOutputTab('logs');
+      }
     } catch (e: any) { setOutput(String(e.message || e)); }
     finally { setLoading(false); }
   }
@@ -30,6 +43,7 @@ export function ProjectDetail() {
   async function action(label: string, path: string) {
     setBusy(label);
     setOutput(`> ${label}…\n`);
+    setOutputTab('output');
     try {
       const r = await api.post<{ ok: boolean; log: string }>(`/projects/${encodeURIComponent(name)}/${path}`);
       setOutput((cur) => cur + (r.log || '(no output)') + '\n\n✓ done');
@@ -41,14 +55,14 @@ export function ProjectDetail() {
     }
   }
 
-  async function tailLogs() {
-    setBusy('logs');
+  async function loadLogs() {
+    setLogsLoading(true);
     try {
       const text = await api.text(`/projects/${encodeURIComponent(name)}/logs?tail=200`);
-      setOutput(text);
+      setLogs(text || '(no logs)');
     } catch (e: any) {
-      setOutput(String(e.message || e));
-    } finally { setBusy(null); }
+      setLogs('✗ ' + (e?.body?.message || e.message || String(e)));
+    } finally { setLogsLoading(false); }
   }
 
   return (
@@ -103,20 +117,36 @@ export function ProjectDetail() {
       </section>
 
       <section className="mt-6">
-        <div className="flex items-baseline justify-between mb-2">
-          <h2 className="text-sm font-semibold text-gray-900">Output</h2>
-          <button
-            onClick={tailLogs}
-            disabled={busy === 'logs'}
-            className="inline-flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-gray-500 hover:text-gray-900 transition-colors disabled:opacity-50"
-          >
-            {busy === 'logs' ? <Loader2 size={12} className="animate-spin" /> : <ScrollText size={12} strokeWidth={2.5} />}
-            Tail logs
-          </button>
+        <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+          <div className="inline-flex bg-gray-100 rounded-lg p-1 gap-1">
+            <TabButton active={outputTab === 'output'} onClick={() => setOutputTab('output')} icon={Terminal} label="Action output" />
+            <TabButton active={outputTab === 'logs'} onClick={() => { setOutputTab('logs'); if (!logs && !logsLoading) void loadLogs(); }} icon={ScrollText} label={`Container logs${stats && stats.runningCount < stats.total ? ' ⚠' : ''}`} />
+          </div>
+          {outputTab === 'logs' && (
+            <button
+              onClick={loadLogs}
+              disabled={logsLoading}
+              className="inline-flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-gray-500 hover:text-gray-900 transition-colors disabled:opacity-50"
+            >
+              {logsLoading ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} strokeWidth={2.5} />}
+              Refresh logs
+            </button>
+          )}
         </div>
-        <pre className="rounded-xl border border-gray-200 bg-gray-900 text-green-200 p-4 text-xs leading-snug font-mono whitespace-pre-wrap break-all max-h-96 overflow-y-auto">
-          {output || '(no output yet — pick an action above or tail logs)'}
-        </pre>
+        {outputTab === 'output' ? (
+          <pre className="rounded-xl border border-gray-200 bg-gray-900 text-green-200 p-4 text-xs leading-snug font-mono whitespace-pre-wrap break-all max-h-96 overflow-y-auto">
+            {output || '(no output yet — pick an action above)'}
+          </pre>
+        ) : (
+          <pre className="rounded-xl border border-gray-200 bg-gray-900 text-green-200 p-4 text-xs leading-snug font-mono whitespace-pre-wrap break-all max-h-96 overflow-y-auto">
+            {logsLoading && !logs ? 'Loading logs…' : (logs || '(no logs loaded — click Refresh)')}
+          </pre>
+        )}
+        {stats && stats.total > 0 && stats.runningCount < stats.total && outputTab === 'logs' && (
+          <p className="mt-2 text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-2.5 py-1.5">
+            ⚠ {stats.total - stats.runningCount} of {stats.total} containers are not running — logs auto-loaded so you can see why.
+          </p>
+        )}
       </section>
 
       {/* Danger zone — separated visually so it doesn't sit next to routine actions. */}
@@ -272,6 +302,22 @@ function RemoveProjectModal({
         )}
       </div>
     </div>
+  );
+}
+
+function TabButton({
+  active, onClick, icon: Icon, label,
+}: { active: boolean; onClick: () => void; icon: any; label: string }) {
+  return (
+    <button
+      onClick={onClick}
+      className={`inline-flex items-center gap-1.5 h-9 px-3 rounded-md text-xs font-bold uppercase tracking-wide transition-colors ${
+        active ? 'bg-white shadow text-gray-900' : 'text-gray-500 hover:text-gray-700'
+      }`}
+    >
+      <Icon size={12} strokeWidth={2.5} />
+      {label}
+    </button>
   );
 }
 

@@ -16,5 +16,9 @@ services:
       # The host's /opt directory, where every project lives. Read-write so
       # the reverse-proxy editor + (future) staging-clone can update files.
       - /opt:/host/opt
+      # Host /proc, read-only — so the VPS Health page can read host RAM,
+      # loadavg, uptime, and per-process CPU/mem from the actual host
+      # rather than the container's namespaced view.
+      - /proc:/host/proc:ro
     ports:
       - "8089:8089"

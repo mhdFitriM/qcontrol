@@ -91,6 +91,177 @@ app.get('/api/auth/whoami', (req, res) => {
   res.json({ authed: !!TOKEN && supplied === TOKEN });
 });
 
+// ─── VPS health (CPU / mem / disk / processes / containers) ──────────────
+//
+// We mount /proc from the host at /host/proc:ro, so reading these files
+// gives us the *host's* numbers — not the container's namespaced view.
+// If the mount isn't there (dev box), we fall back to the container view
+// gracefully; the page just shows the dev environment's numbers.
+const HOST_PROC = existsSync('/host/proc') ? '/host/proc' : '/proc';
+
+async function readProc(name) {
+  try { return await readFile(path.join(HOST_PROC, name), 'utf8'); }
+  catch { return ''; }
+}
+
+function parseMeminfo(body) {
+  const out = {};
+  for (const line of body.split('\n')) {
+    const m = line.match(/^(\w+):\s+(\d+)\s*(\w+)?/);
+    if (m) out[m[1]] = Number(m[2]) * 1024; // /proc/meminfo is in kB
+  }
+  return out;
+}
+
+async function readVpsHealth() {
+  const [meminfoBody, loadavgBody, uptimeBody, cpuinfoBody, statBody, hostnameBody, osBody] = await Promise.all([
+    readProc('meminfo'),
+    readProc('loadavg'),
+    readProc('uptime'),
+    readProc('cpuinfo'),
+    readProc('stat'),
+    readFile('/etc/hostname', 'utf8').catch(() => ''),
+    readFile('/etc/os-release', 'utf8').catch(() => ''),
+  ]);
+
+  const mem = parseMeminfo(meminfoBody);
+  const memTotal = mem.MemTotal || 0;
+  const memAvailable = mem.MemAvailable ?? (mem.MemFree || 0) + (mem.Buffers || 0) + (mem.Cached || 0);
+  const memUsed = memTotal - memAvailable;
+  const swapTotal = mem.SwapTotal || 0;
+  const swapUsed = swapTotal - (mem.SwapFree || 0);
+
+  const loadParts = loadavgBody.trim().split(/\s+/);
+  const loadavg = loadParts.length >= 3 ? [Number(loadParts[0]), Number(loadParts[1]), Number(loadParts[2])] : [0, 0, 0];
+
+  const uptimeSeconds = Number((uptimeBody.split(/\s+/)[0] || '0'));
+  const cpuCount = (cpuinfoBody.match(/^processor\s*:/gm) || []).length || 1;
+
+  // CPU usage % — derived from the first sample of /proc/stat. To get a
+  // real "right now" number you'd diff two samples; for a snapshot page
+  // we estimate from uptime + idle time (cumulative since boot — good
+  // enough as a coarse load indicator alongside loadavg).
+  let cpuUsedPct = null;
+  const cpuLine = statBody.split('\n').find((l) => l.startsWith('cpu '));
+  if (cpuLine) {
+    const nums = cpuLine.split(/\s+/).slice(1).map(Number);
+    const [user, nice, system, idle, iowait = 0, irq = 0, softirq = 0, steal = 0] = nums;
+    const total = user + nice + system + idle + iowait + irq + softirq + steal;
+    const busy = total - idle - iowait;
+    if (total > 0) cpuUsedPct = (busy / total) * 100;
+  }
+
+  // Disk — df against /host/opt (the mount of the host's /opt), and also
+  // ask docker about its own root. df is in the container but the bind
+  // mount points to the host filesystem, so the numbers are real.
+  const disks = [];
+  try {
+    const r = await execFileP('df', ['-PB1', '/host/opt'], { timeout: 3000 });
+    const lines = r.stdout.trim().split('\n').slice(1);
+    for (const line of lines) {
+      const parts = line.split(/\s+/);
+      if (parts.length < 6) continue;
+      disks.push({
+        mount: '/opt',
+        filesystem: parts[0],
+        sizeBytes: Number(parts[1]),
+        usedBytes: Number(parts[2]),
+        availBytes: Number(parts[3]),
+        usedPct: Number((parts[4] || '0').replace('%', '')),
+      });
+    }
+  } catch { /* df missing — fine */ }
+
+  const hostname = hostnameBody.trim();
+  const osMatch = osBody.match(/^PRETTY_NAME="?([^"\n]+)"?/m);
+  const os = osMatch ? osMatch[1] : '';
+
+  return {
+    hostname,
+    os,
+    uptimeSeconds,
+    cpu: { count: cpuCount, usedPct: cpuUsedPct, loadavg },
+    memory: { totalBytes: memTotal, usedBytes: memUsed, availableBytes: memAvailable, usedPct: memTotal > 0 ? (memUsed / memTotal) * 100 : 0 },
+    swap: { totalBytes: swapTotal, usedBytes: swapUsed, usedPct: swapTotal > 0 ? (swapUsed / swapTotal) * 100 : 0 },
+    disks,
+  };
+}
+
+/** Top processes by RSS. Walks /host/proc to read each pid's status +
+ *  comm + cmdline. Cheap because we cap at top N after sorting. */
+async function readTopProcesses(limit = 12) {
+  let entries = [];
+  try { entries = await readdir(HOST_PROC, { withFileTypes: true }); } catch { return []; }
+  const procs = [];
+  for (const e of entries) {
+    if (!/^\d+$/.test(e.name)) continue;
+    const pid = e.name;
+    try {
+      const [statusBody, cmdlineBody, statBody] = await Promise.all([
+        readFile(path.join(HOST_PROC, pid, 'status'), 'utf8').catch(() => ''),
+        readFile(path.join(HOST_PROC, pid, 'cmdline'), 'utf8').catch(() => ''),
+        readFile(path.join(HOST_PROC, pid, 'stat'), 'utf8').catch(() => ''),
+      ]);
+      const rssMatch = statusBody.match(/VmRSS:\s+(\d+)/);
+      const nameMatch = statusBody.match(/^Name:\s+(.+)/m);
+      const uidMatch = statusBody.match(/^Uid:\s+(\d+)/m);
+      const stateMatch = statusBody.match(/^State:\s+(\S)/m);
+      if (!rssMatch || !nameMatch) continue;
+      const cmd = cmdlineBody.replace(/\0+/g, ' ').trim() || nameMatch[1];
+
+      // utime+stime are columns 14+15 in /proc/[pid]/stat. The line has
+      // the form: pid (comm) state ppid ... where (comm) may contain
+      // spaces — slice from the rightmost ')' to be safe.
+      let cpuTicks = 0;
+      const closeParen = statBody.lastIndexOf(')');
+      if (closeParen !== -1) {
+        const after = statBody.slice(closeParen + 2).split(/\s+/);
+        const utime = Number(after[11]); const stime = Number(after[12]);
+        if (Number.isFinite(utime) && Number.isFinite(stime)) cpuTicks = utime + stime;
+      }
+
+      procs.push({
+        pid: Number(pid),
+        name: nameMatch[1],
+        cmd: cmd.length > 120 ? cmd.slice(0, 120) + '…' : cmd,
+        uid: Number(uidMatch?.[1] ?? 0),
+        state: stateMatch?.[1] || '',
+        rssBytes: Number(rssMatch[1]) * 1024,
+        cpuTicks,
+      });
+    } catch { /* race: process exited between readdir and reads */ }
+  }
+  procs.sort((a, b) => b.rssBytes - a.rssBytes);
+  return procs.slice(0, limit);
+}
+
+app.get('/api/vps/health', authed, async (_req, res) => {
+  try {
+    const [health, topProcs] = await Promise.all([readVpsHealth(), readTopProcesses(15)]);
+    res.json({ ...health, topProcesses: topProcs });
+  } catch (e) {
+    res.status(500).json({ error: 'health_failed', message: e.message });
+  }
+});
+
+app.get('/api/vps/containers/stats', authed, async (_req, res) => {
+  // docker stats --no-stream gives a one-shot snapshot for every container.
+  try {
+    const { stdout } = await execFileP(
+      'docker',
+      ['stats', '--no-stream', '--format', '{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}'],
+      { timeout: 10000, maxBuffer: 2 * 1024 * 1024 },
+    );
+    const rows = stdout.trim().split('\n').filter(Boolean).map((line) => {
+      const [name, cpu, mem, memPct, netIO, blockIO] = line.split('\t');
+      return { name, cpu, mem, memPct, netIO, blockIO };
+    });
+    res.json({ data: rows });
+  } catch (e) {
+    res.status(500).json({ error: 'docker_error', message: e.message });
+  }
+});
+
 // ─── projects (read-only enumeration) ────────────────────────────────────
 async function listProjects() {
   let entries = [];
@@ -348,6 +519,40 @@ function nextFreePort(used, start = 8088) {
   throw new Error('No free port in 8088-8999');
 }
 
+/** Convert a project name to the SLUG used as an env-var prefix in
+ *  /opt/reverse-proxy/.env — upper-case, dashes → underscores. Used both
+ *  when WRITING new entries and when DETECTING the source project's
+ *  existing entries so we can suggest re-mapping them on a clone. */
+function projectEnvSlug(projectName) {
+  return slugify(projectName).toUpperCase().replace(/-/g, '_');
+}
+
+/** Parse /opt/reverse-proxy/.env and return every `<SLUG>_…_DOMAIN=value`
+ *  line that belongs to `projectName`. Returns
+ *  `[{ envKey, destKeySuffix, value }]` where destKeySuffix is the part
+ *  AFTER the SLUG prefix (e.g. for QBOTU_API_DOMAIN we get 'API_DOMAIN',
+ *  for the bare QBOTU_DOMAIN we get 'DOMAIN'). Lets the UI surface every
+ *  domain the source already serves so the clone gets one new domain per
+ *  source domain, all wired to the new upstream. */
+async function readSourceDomainEntries(projectName) {
+  const slug = projectEnvSlug(projectName);
+  const re = new RegExp(`^${slug}((?:_[A-Z0-9]+)*?_DOMAIN)\\s*=\\s*(.+?)\\s*$`);
+  const entries = [];
+  try {
+    const body = await readFile(path.join(REVERSE_PROXY_DIR, '.env'), 'utf8');
+    for (const line of body.split('\n')) {
+      const m = line.match(re);
+      if (!m) continue;
+      entries.push({
+        envKey: `${slug}${m[1]}`,
+        destKeySuffix: m[1].replace(/^_/, ''), // drop leading underscore
+        value: m[2],
+      });
+    }
+  } catch { /* file missing — return [] */ }
+  return entries;
+}
+
 app.get('/api/projects/:name/clone-info', authed, async (req, res) => {
   const project = req.params.name;
   const dir = path.join(HOST_OPT, project);
@@ -367,6 +572,7 @@ app.get('/api/projects/:name/clone-info', authed, async (req, res) => {
 
   const used = await collectUsedPorts();
   const suggestedPort = nextFreePort(used);
+  const sourceDomains = await readSourceDomainEntries(project);
 
   res.json({
     source: project,
@@ -375,6 +581,7 @@ app.get('/api/projects/:name/clone-info', authed, async (req, res) => {
     suggestedDest: `${project}-staging`,
     suggestedPort,
     usedPorts: Array.from(used).sort((a, b) => a - b),
+    sourceDomains,
   });
 });
 
@@ -384,10 +591,26 @@ app.post('/api/projects/clone', authed, async (req, res) => {
     dest: rawDest,
     method = 'git',           // 'git' or 'copy'
     branch,                   // required when method=git
-    domain,                   // optional — when set, we wire reverse-proxy
+    domain,                   // legacy single-domain field (kept for back-compat)
+    domainMappings: rawDomainMappings, // new — [{ destKeySuffix, sourceDomain, destDomain }]
     port: rawPort,            // optional — auto-allocate when missing
     reloadCaddy = true,
   } = req.body || {};
+
+  // Normalize domain mappings — either an explicit array, OR derive a
+  // single-entry one from the legacy `domain` param.
+  let domainMappings = Array.isArray(rawDomainMappings)
+    ? rawDomainMappings
+        .map((m) => ({
+          destKeySuffix: String(m.destKeySuffix || 'DOMAIN').toUpperCase().replace(/[^A-Z0-9_]/g, '_'),
+          sourceDomain: (m.sourceDomain || '').trim(),
+          destDomain: (m.destDomain || '').trim(),
+        }))
+        .filter((m) => m.destDomain) // skip blanks
+    : [];
+  if (domainMappings.length === 0 && domain) {
+    domainMappings = [{ destKeySuffix: 'DOMAIN', sourceDomain: '', destDomain: String(domain).trim() }];
+  }
 
   const log = [];
   const push = (line) => log.push(line);
@@ -423,8 +646,9 @@ app.post('/api/projects/clone', authed, async (req, res) => {
       try {
         // Exclude .env: the source's env points at the source's port + DB, never
         // safe to carry over verbatim. The user starts the staging instance with
-        // a fresh .env they generate on the VPS.
-        const r = await execFileP('rsync', ['-a', '--exclude', '.git', '--exclude', 'node_modules', '--exclude', 'vendor', '--exclude', 'data', '--exclude', '.env', `${srcDir}/`, `${destDir}/`], { timeout: 10 * 60 * 1000 });
+        // .env IS carried over now — qcontrol will rewrite its ports +
+        // domain values below, which is the whole reason we're doing this.
+        const r = await execFileP('rsync', ['-a', '--exclude', '.git', '--exclude', 'node_modules', '--exclude', 'vendor', '--exclude', 'data', `${srcDir}/`, `${destDir}/`], { timeout: 10 * 60 * 1000 });
         push(r.stdout + r.stderr || '(rsync ok)');
       } catch {
         const r = await execFileP('cp', ['-r', srcDir, destDir], { timeout: 10 * 60 * 1000 });
@@ -491,25 +715,87 @@ app.post('/api/projects/clone', authed, async (req, res) => {
     push('==> no docker-compose.vps.yml in source — skipping port rewrite (start the clone with the source\'s ports!)');
   }
 
-  // 2) Optionally wire reverse-proxy: append .env vars + Caddyfile block, validate, reload.
-  let proxyDetails = null;
-  if (domain) {
-    const slug = slugify(dest).toUpperCase().replace(/-/g, '_');
-    const envLine1 = `${slug}_DOMAIN=${domain}`;
-    const envLine2 = `${slug}_UPSTREAM=127.0.0.1:${port}`;
-    const caddyBlock = `{$${slug}_DOMAIN} {\n  reverse_proxy {$${slug}_UPSTREAM}\n}\n`;
+  // 1.75) Rewrite the cloned project's own .env (if one exists). The
+  //       source's .env carries production hostnames and HOST_PORT values
+  //       that point at the source's stack — leaving them unchanged means
+  //       the staging clone serves the wrong domain bindings (so internal
+  //       nginx routing misses) and binds the wrong host ports (collides
+  //       with the source). We rewrite:
+  //         • every `*_HOST_PORT=N`  →  portMap[N]  (if remapped)
+  //         • every occurrence of sourceDomain → destDomain across the file
+  //           (catches APP_DOMAIN, API_DOMAIN, FRONTEND_URL, API_URL,
+  //            VITE_API_BASE_URL, MINIO_URL, etc. without us having to
+  //            enumerate every var name a given stack might use)
+  const destEnvPath = path.join(destDir, '.env');
+  if (existsSync(destEnvPath)) {
+    try {
+      let envBody = await readFile(destEnvPath, 'utf8');
+      const rewrites = [];
+
+      // Port rewrites — only touch lines that look like a HOST_PORT.
+      if (Object.keys(portMap).length > 0) {
+        envBody = envBody.replace(/^([A-Z_]+_HOST_PORT)\s*=\s*(\d{2,5})\s*$/gm, (line, key, val) => {
+          const n = Number(val);
+          if (portMap[n]) { rewrites.push(`${key}: ${n} → ${portMap[n]}`); return `${key}=${portMap[n]}`; }
+          return line;
+        });
+      }
+
+      // Domain rewrites — pure string replacement, applied longest-first
+      // so e.g. hub-api.qbot.jp gets swapped before hub.qbot.jp (otherwise
+      // the shorter prefix would gobble the longer one).
+      const mappingsByLength = [...domainMappings]
+        .filter((m) => m.sourceDomain)
+        .sort((a, b) => b.sourceDomain.length - a.sourceDomain.length);
+      for (const m of mappingsByLength) {
+        const re = new RegExp(m.sourceDomain.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g');
+        const before = envBody;
+        envBody = envBody.replace(re, m.destDomain);
+        if (before !== envBody) rewrites.push(`domain: ${m.sourceDomain} → ${m.destDomain}`);
+      }
+
+      if (rewrites.length > 0) {
+        await writeFile(destEnvPath, envBody, 'utf8');
+        push(`==> rewrote /opt/${dest}/.env (${rewrites.length} change${rewrites.length === 1 ? '' : 's'}):`);
+        for (const r of rewrites) push(`     • ${r}`);
+      } else {
+        push(`==> /opt/${dest}/.env carried over verbatim (no matching port/domain rewrites)`);
+      }
+    } catch (e) {
+      push('✗ .env rewrite failed (cloned tree still on disk): ' + e.message);
+    }
+  } else {
+    push(`==> no .env in cloned tree at /opt/${dest}/.env — skipping env rewrite (you may need to create one before bringing the stack up)`);
+  }
+
+  // 2) Wire reverse-proxy: one Caddy block + env entry per mapped domain,
+  //    all pointing at a single shared `${SLUG}_UPSTREAM`. This matches the
+  //    qbotu pattern of one proxy fronting multiple Host headers.
+  const proxyDetails = [];
+  if (domainMappings.length > 0) {
+    const slug = projectEnvSlug(dest);
+    const envPath = path.join(REVERSE_PROXY_DIR, '.env');
+    const caddyPath = path.join(REVERSE_PROXY_DIR, 'Caddyfile');
+
+    // Build env block: one UPSTREAM line + one DOMAIN line per mapping.
+    const envLines = [`${slug}_UPSTREAM=127.0.0.1:${port}`];
+    const caddyBlocks = [];
+    for (const m of domainMappings) {
+      const envKey = `${slug}_${m.destKeySuffix}`;
+      envLines.push(`${envKey}=${m.destDomain}`);
+      caddyBlocks.push(`{$${envKey}} {\n  reverse_proxy {$${slug}_UPSTREAM}\n}\n`);
+      proxyDetails.push({ domain: m.destDomain, envKey, sourceDomain: m.sourceDomain || null });
+    }
 
     try {
-      const envPath = path.join(REVERSE_PROXY_DIR, '.env');
-      const caddyPath = path.join(REVERSE_PROXY_DIR, 'Caddyfile');
       const existingEnv = (await readFile(envPath, 'utf8').catch(() => '')) || '';
-      const newEnv = existingEnv.replace(/\s*$/, '') + `\n\n# ${dest}\n${envLine1}\n${envLine2}\n`;
+      const newEnv = existingEnv.replace(/\s*$/, '') + `\n\n# ${dest}\n${envLines.join('\n')}\n`;
       await writeFile(envPath, newEnv, 'utf8');
-      push('==> appended to /opt/reverse-proxy/.env');
+      push(`==> appended ${envLines.length} line(s) to /opt/reverse-proxy/.env`);
 
       const existingCaddy = await readFile(caddyPath, 'utf8');
-      await writeFile(caddyPath, existingCaddy.replace(/\s*$/, '') + '\n\n' + caddyBlock, 'utf8');
-      push('==> appended to /opt/reverse-proxy/Caddyfile');
+      await writeFile(caddyPath, existingCaddy.replace(/\s*$/, '') + '\n\n' + caddyBlocks.join('\n'), 'utf8');
+      push(`==> appended ${caddyBlocks.length} block(s) to /opt/reverse-proxy/Caddyfile`);
 
       if (reloadCaddy) {
         // Pre-validates in a throw-away container BEFORE recreating, so a
@@ -521,7 +807,6 @@ app.post('/api/projects/clone', authed, async (req, res) => {
           push('   (.env and Caddyfile were written but Caddy was left on the OLD config — your traffic is still live)');
         }
       }
-      proxyDetails = { domain, port, envKey: slug };
     } catch (e) {
       push('✗ reverse-proxy wire-up failed: ' + e.message);
     }

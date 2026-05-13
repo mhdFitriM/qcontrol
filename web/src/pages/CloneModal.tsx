@@ -1,7 +1,9 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Copy, Loader2, X, CheckCircle2, AlertTriangle } from 'lucide-react';
 import { api } from '../lib/api';
+
+interface SourceDomain { envKey: string; destKeySuffix: string; value: string; }
 
 interface CloneInfo {
   source: string;
@@ -10,7 +12,10 @@ interface CloneInfo {
   suggestedDest: string;
   suggestedPort: number;
   usedPorts: number[];
+  sourceDomains: SourceDomain[];
 }
+
+interface DomainMapping { destKeySuffix: string; sourceDomain: string; destDomain: string; }
 
 interface CloneResult {
   ok: boolean;
@@ -18,20 +23,10 @@ interface CloneResult {
   destDir?: string;
   port?: number;
   portMap?: Record<string, number>;
-  proxy?: { domain: string; port: number; envKey: string } | null;
+  proxy?: Array<{ domain: string; envKey: string; sourceDomain: string | null }>;
   log?: string;
 }
 
-/**
- * Clone-to-staging wizard. Opens for a single source project, lets the user
- * pick a method (git clone vs full copy), branch (if git), dest folder name,
- * and an optional public domain. On submit it:
- *   1. Clones/copies /opt/<source> → /opt/<dest>
- *   2. Allocates the next free upstream port (or uses what they typed)
- *   3. Appends to /opt/reverse-proxy/.env and Caddyfile
- *   4. Validates + reloads Caddy
- *   5. Returns a success card with the new path + link to project detail
- */
 export function CloneModal({ source, onClose }: { source: string; onClose: () => void }) {
   const [info, setInfo] = useState<CloneInfo | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -42,9 +37,12 @@ export function CloneModal({ source, onClose }: { source: string; onClose: () =>
   const [dest, setDest] = useState('');
   const [method, setMethod] = useState<'git' | 'copy'>('git');
   const [branch, setBranch] = useState('main');
-  const [domain, setDomain] = useState('');
   const [port, setPort] = useState('');
   const [reloadCaddy, setReloadCaddy] = useState(true);
+
+  // domain mappings — one row per source domain we detected, plus a single
+  // free-form row when the source has no detected reverse-proxy entries.
+  const [mappings, setMappings] = useState<DomainMapping[]>([]);
 
   useEffect(() => {
     (async () => {
@@ -55,22 +53,50 @@ export function CloneModal({ source, onClose }: { source: string; onClose: () =>
         setPort(String(r.suggestedPort));
         if (!r.gitRemote) setMethod('copy');
         if (r.branches.length > 0 && !r.branches.includes('main')) setBranch(r.branches[0]);
+
+        // Seed mapping rows. If the source has detected domains, one row
+        // per source domain, dest fields blank for the user to fill. Else
+        // a single empty row for ad-hoc wiring.
+        if (r.sourceDomains.length > 0) {
+          setMappings(r.sourceDomains.map((d) => ({
+            destKeySuffix: d.destKeySuffix,
+            sourceDomain: d.value,
+            destDomain: '',
+          })));
+        } else {
+          setMappings([{ destKeySuffix: 'DOMAIN', sourceDomain: '', destDomain: '' }]);
+        }
       } catch (e: any) {
         setLoadError(e.message || 'Failed to load source info');
       }
     })();
   }, [source]);
 
+  const hasAnyDestDomain = useMemo(() => mappings.some((m) => m.destDomain.trim()), [mappings]);
+
+  function updateMapping(i: number, patch: Partial<DomainMapping>) {
+    setMappings((rows) => rows.map((row, idx) => (idx === i ? { ...row, ...patch } : row)));
+  }
+  function addMappingRow() {
+    setMappings((rows) => [...rows, { destKeySuffix: `DOMAIN_${rows.length}`, sourceDomain: '', destDomain: '' }]);
+  }
+  function removeMappingRow(i: number) {
+    setMappings((rows) => rows.filter((_, idx) => idx !== i));
+  }
+
   async function submit() {
     setSubmitting(true);
     setResult(null);
     try {
+      const cleaned = mappings
+        .map((m) => ({ ...m, destDomain: m.destDomain.trim(), sourceDomain: m.sourceDomain.trim() }))
+        .filter((m) => m.destDomain);
       const r = await api.post<CloneResult>('/projects/clone', {
         source,
         dest,
         method,
         branch,
-        domain: domain.trim() || undefined,
+        domainMappings: cleaned,
         port: port ? Number(port) : undefined,
         reloadCaddy,
       });
@@ -141,8 +167,8 @@ export function CloneModal({ source, onClose }: { source: string; onClose: () =>
                 </div>
                 <p className="text-[11px] text-gray-500 mt-1.5">
                   {method === 'git'
-                    ? 'Fresh checkout from the source\'s git remote. No .env carried over.'
-                    : 'Recursive copy (rsync if available, else cp -r). Excludes .git, node_modules, vendor, data.'}
+                    ? 'Fresh checkout from the source\'s git remote. .env is included if committed.'
+                    : 'Recursive copy (rsync if available). Includes .env so qcontrol can rewrite it.'}
                 </p>
               </Field>
 
@@ -159,35 +185,68 @@ export function CloneModal({ source, onClose }: { source: string; onClose: () =>
                 </Field>
               )}
 
-              <div className="grid grid-cols-1 sm:grid-cols-[1fr_auto] gap-3">
-                <Field label="Public domain (optional)" hint="Leave blank to skip reverse-proxy wiring">
-                  <input
-                    value={domain}
-                    onChange={(e) => setDomain(e.target.value)}
-                    placeholder="staging.qparking.qbot.now"
-                    spellCheck={false}
-                    className="w-full h-10 px-3 border border-gray-300 rounded-lg text-sm font-mono focus:outline-none focus:border-gray-900"
-                  />
-                </Field>
-                <Field label="Upstream port" hint={`Suggested: ${info.suggestedPort}`}>
-                  <input
-                    value={port}
-                    onChange={(e) => setPort(e.target.value.replace(/[^0-9]/g, ''))}
-                    inputMode="numeric"
-                    className="w-28 h-10 px-3 border border-gray-300 rounded-lg text-sm font-mono tabular-nums focus:outline-none focus:border-gray-900"
-                  />
-                </Field>
+              <Field label="Upstream port" hint={`Suggested: ${info.suggestedPort}. If the source's compose binds multiple ports, the others get auto-allocated starting from here.`}>
+                <input
+                  value={port}
+                  onChange={(e) => setPort(e.target.value.replace(/[^0-9]/g, ''))}
+                  inputMode="numeric"
+                  className="w-28 h-10 px-3 border border-gray-300 rounded-lg text-sm font-mono tabular-nums focus:outline-none focus:border-gray-900"
+                />
+              </Field>
+
+              <div>
+                <div className="flex items-baseline justify-between mb-1">
+                  <label className="block text-[11px] font-semibold uppercase tracking-wide text-gray-700">
+                    Domain mappings {info.sourceDomains.length > 0 && <span className="text-gray-400 font-normal normal-case">(detected from source's reverse-proxy entries)</span>}
+                  </label>
+                  <button type="button" onClick={addMappingRow} className="text-[11px] font-semibold uppercase tracking-wide text-gray-500 hover:text-gray-900">
+                    + Add row
+                  </button>
+                </div>
+                <div className="space-y-2">
+                  {mappings.map((m, i) => (
+                    <div key={i} className="grid grid-cols-[1fr_auto_1fr_auto] gap-2 items-center">
+                      <input
+                        value={m.sourceDomain}
+                        onChange={(e) => updateMapping(i, { sourceDomain: e.target.value })}
+                        placeholder="hub.qbot.jp"
+                        spellCheck={false}
+                        title={`Source's env key: ${m.destKeySuffix}`}
+                        className="h-9 px-2.5 border border-gray-300 rounded-lg text-xs font-mono bg-gray-50 focus:outline-none focus:border-gray-900"
+                      />
+                      <span className="text-xs text-gray-400">→</span>
+                      <input
+                        value={m.destDomain}
+                        onChange={(e) => updateMapping(i, { destDomain: e.target.value })}
+                        placeholder="staging-qbotu.qbot.now"
+                        spellCheck={false}
+                        className="h-9 px-2.5 border border-gray-300 rounded-lg text-xs font-mono focus:outline-none focus:border-gray-900"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => removeMappingRow(i)}
+                        aria-label="Remove row"
+                        className="w-9 h-9 rounded-lg text-gray-400 hover:text-red-600 hover:bg-red-50 inline-flex items-center justify-center"
+                      >
+                        <X size={14} strokeWidth={2.5} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+                <p className="text-[11px] text-gray-500 mt-2 leading-relaxed">
+                  Each mapped destination gets its own Caddy block, all pointing to a single shared upstream. qcontrol also substitutes every occurrence of the source domain in the cloned project's <code className="font-mono">.env</code> (catches <code className="font-mono">APP_DOMAIN</code>, <code className="font-mono">API_URL</code>, <code className="font-mono">VITE_API_BASE_URL</code>, etc. without naming each one). Leave all dest blank to skip reverse-proxy wiring.
+                </p>
               </div>
 
-              {domain && (
+              {hasAnyDestDomain && (
                 <label className="flex items-center gap-2 text-xs text-gray-700">
                   <input type="checkbox" checked={reloadCaddy} onChange={(e) => setReloadCaddy(e.target.checked)} className="accent-gray-900" />
-                  Validate + reload Caddy after wiring (recommended)
+                  Pre-validate + recreate Caddy after wiring (recommended — picks up new env vars immediately, no downtime if config is clean)
                 </label>
               )}
 
               <div className="rounded-lg bg-gray-50 border border-gray-200 px-3 py-2.5 text-[11px] text-gray-600">
-                <strong>What happens next:</strong> qcontrol will create <code className="font-mono">/opt/{dest}</code>{domain ? ' and append the domain + upstream to /opt/reverse-proxy/.env + Caddyfile' : ''}. You still need to copy / edit <code className="font-mono">/opt/{dest}/.env</code> manually before bringing the stack up (the source's .env is intentionally not copied).
+                <strong>What happens:</strong> create <code className="font-mono">/opt/{dest}</code>, rewrite its <code className="font-mono">docker-compose.vps.yml</code> ports + <code className="font-mono">.env</code> ports/domains, then{hasAnyDestDomain ? ` append ${mappings.filter((m) => m.destDomain.trim()).length} block(s) to the reverse-proxy.` : ' skip reverse-proxy wiring.'} You still need to bring the stack up with <code className="font-mono">docker compose up -d</code> in the new folder.
               </div>
             </div>
           )}
@@ -207,7 +266,18 @@ export function CloneModal({ source, onClose }: { source: string; onClose: () =>
                   <div className="mt-1 text-xs space-y-0.5">
                     <div>Destination: <code className="font-mono">{result.destDir}</code></div>
                     <div>Public upstream port: <span className="font-mono">{result.port}</span></div>
-                    {result.proxy && <div>Domain: <span className="font-mono">{result.proxy.domain}</span></div>}
+                    {result.proxy && result.proxy.length > 0 && (
+                      <div>
+                        Domains wired:
+                        <div className="mt-1 flex flex-wrap gap-1.5">
+                          {result.proxy.map((p) => (
+                            <span key={p.envKey} className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-white/60 border border-emerald-300 text-emerald-900 font-mono text-[11px]">
+                              {p.domain}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                     {result.portMap && Object.keys(result.portMap).length > 0 && (
                       <div>
                         Port remap (source → new):

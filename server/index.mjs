@@ -384,7 +384,10 @@ app.post('/api/projects/clone', authed, async (req, res) => {
     } else if (method === 'copy') {
       push(`==> cp -r ${srcDir} → ${destDir}`);
       try {
-        const r = await execFileP('rsync', ['-a', '--exclude', '.git', '--exclude', 'node_modules', '--exclude', 'vendor', '--exclude', 'data', `${srcDir}/`, `${destDir}/`], { timeout: 10 * 60 * 1000 });
+        // Exclude .env: the source's env points at the source's port + DB, never
+        // safe to carry over verbatim. The user starts the staging instance with
+        // a fresh .env they generate on the VPS.
+        const r = await execFileP('rsync', ['-a', '--exclude', '.git', '--exclude', 'node_modules', '--exclude', 'vendor', '--exclude', 'data', '--exclude', '.env', `${srcDir}/`, `${destDir}/`], { timeout: 10 * 60 * 1000 });
         push(r.stdout + r.stderr || '(rsync ok)');
       } catch {
         const r = await execFileP('cp', ['-r', srcDir, destDir], { timeout: 10 * 60 * 1000 });
@@ -396,6 +399,59 @@ app.post('/api/projects/clone', authed, async (req, res) => {
   } catch (e) {
     push('✗ ' + (e.stderr || e.message));
     return res.status(500).json({ ok: false, log: log.join('\n') });
+  }
+
+  // 1.5) Rewrite the cloned project's docker-compose.vps.yml so its
+  //      published ports don't collide with the source. The clone inherits
+  //      the SOURCE's `127.0.0.1:NNNN:M` bindings verbatim — if the source
+  //      is already running on those ports, the new staging stack either
+  //      fails to start or reuses them, and the reverse-proxy upstream we
+  //      just allocated points at a port that nothing is listening on.
+  //
+  // Strategy:
+  //   • parse every `127.0.0.1:<port>:` in the cloned overlay
+  //   • allocate a consecutive new port for each unique source port,
+  //     starting from `port` (the auto-allocated upstream we already had)
+  //   • rewrite the file in-place
+  //   • the FIRST new port becomes the public-facing upstream the
+  //     reverse-proxy block points at (multi-port projects with path-split
+  //     routing still need a manual Caddy edit, but the single-port case —
+  //     which is most projects — is fully automatic).
+  const overlayPath = path.join(destDir, 'docker-compose.vps.yml');
+  let portMap = {};
+  if (existsSync(overlayPath)) {
+    try {
+      let body = await readFile(overlayPath, 'utf8');
+      const matches = [...body.matchAll(/127\.0\.0\.1:(\d{2,5}):/g)];
+      const uniqueSourcePorts = [...new Set(matches.map((m) => Number(m[1])))];
+      if (uniqueSourcePorts.length > 0) {
+        const used = await collectUsedPorts();
+        // The user/auto-allocated `port` is the first new port we want.
+        // Skip past any already-used ports as we walk forward.
+        let cursor = port;
+        for (const srcPort of uniqueSourcePorts) {
+          while (used.has(cursor)) cursor++;
+          portMap[srcPort] = cursor;
+          used.add(cursor);
+          cursor++;
+        }
+        for (const [srcPort, newPort] of Object.entries(portMap)) {
+          const re = new RegExp(`127\\.0\\.0\\.1:${srcPort}:`, 'g');
+          body = body.replace(re, `127.0.0.1:${newPort}:`);
+        }
+        await writeFile(overlayPath, body, 'utf8');
+        push(`==> rewrote ports in docker-compose.vps.yml: ${JSON.stringify(portMap)}`);
+        // Make the FIRST remapped port the reverse-proxy upstream so the
+        // domain we wire below actually reaches a listening socket.
+        port = portMap[uniqueSourcePorts[0]];
+      } else {
+        push('==> docker-compose.vps.yml has no 127.0.0.1 port bindings — nothing to rewrite');
+      }
+    } catch (e) {
+      push('✗ port rewrite failed (cloned tree still on disk): ' + e.message);
+    }
+  } else {
+    push('==> no docker-compose.vps.yml in source — skipping port rewrite (start the clone with the source\'s ports!)');
   }
 
   // 2) Optionally wire reverse-proxy: append .env vars + Caddyfile block, validate, reload.
@@ -456,6 +512,7 @@ app.post('/api/projects/clone', authed, async (req, res) => {
     dest,
     destDir,
     port,
+    portMap,
     proxy: proxyDetails,
     log: log.join('\n'),
   });

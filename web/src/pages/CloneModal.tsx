@@ -17,6 +17,7 @@ interface CloneResult {
   dest?: string;
   destDir?: string;
   port?: number;
+  portMap?: Record<string, number>;
   proxy?: { domain: string; port: number; envKey: string } | null;
   log?: string;
 }
@@ -205,8 +206,20 @@ export function CloneModal({ source, onClose }: { source: string; onClose: () =>
                 {result.ok && (
                   <div className="mt-1 text-xs space-y-0.5">
                     <div>Destination: <code className="font-mono">{result.destDir}</code></div>
-                    <div>Upstream port: <span className="font-mono">{result.port}</span></div>
+                    <div>Public upstream port: <span className="font-mono">{result.port}</span></div>
                     {result.proxy && <div>Domain: <span className="font-mono">{result.proxy.domain}</span></div>}
+                    {result.portMap && Object.keys(result.portMap).length > 0 && (
+                      <div>
+                        Port remap (source → new):
+                        <div className="mt-1 flex flex-wrap gap-1.5">
+                          {Object.entries(result.portMap).map(([src, dst]) => (
+                            <span key={src} className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-white/60 border border-emerald-300 text-emerald-900 font-mono text-[11px]">
+                              {src} → {dst}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>

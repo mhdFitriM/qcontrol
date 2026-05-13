@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { ArrowRight, GitBranch, Loader2, Power } from 'lucide-react';
+import { ArrowRight, Copy, GitBranch, Loader2, Power } from 'lucide-react';
 import { api } from '../lib/api';
+import { CloneModal } from './CloneModal';
 
 interface Project {
   name: string;
@@ -16,6 +17,7 @@ export function Projects() {
   const [data, setData] = useState<Project[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [cloneSource, setCloneSource] = useState<string | null>(null);
 
   async function load() {
     setLoading(true);
@@ -47,12 +49,14 @@ export function Projects() {
 
       <div className="space-y-2">
         {data.map((p) => (
-          <Link
+          <div
             key={p.name}
-            to={`/projects/${encodeURIComponent(p.name)}`}
             className="flex items-center justify-between gap-3 rounded-xl border border-gray-200 bg-white p-4 hover:border-gray-900 transition-colors"
           >
-            <div className="flex items-center gap-3 min-w-0">
+            <Link
+              to={`/projects/${encodeURIComponent(p.name)}`}
+              className="flex items-center gap-3 min-w-0 flex-1"
+            >
               <span
                 className={`w-2 h-2 rounded-full flex-shrink-0 ${p.running ? 'bg-emerald-500' : 'bg-gray-300'}`}
                 aria-label={p.running ? 'running' : 'stopped'}
@@ -71,7 +75,7 @@ export function Projects() {
                   )}
                 </div>
               </div>
-            </div>
+            </Link>
             <div className="flex items-center gap-2 flex-shrink-0">
               {p.hasVpsOverlay && (
                 <span className="text-[10px] font-bold uppercase tracking-wide text-gray-500 bg-gray-100 px-1.5 py-0.5 rounded">vps</span>
@@ -79,11 +83,30 @@ export function Projects() {
               <span className="text-[10px] font-bold uppercase tracking-wide text-gray-500">
                 {p.running ? 'running' : <span className="inline-flex items-center gap-1"><Power size={10} strokeWidth={2.5} /> stopped</span>}
               </span>
-              <ArrowRight size={16} strokeWidth={2.5} className="text-gray-400" />
+              <button
+                onClick={() => setCloneSource(p.name)}
+                title={`Clone ${p.name} as a new instance`}
+                aria-label={`Clone ${p.name}`}
+                className="inline-flex items-center gap-1 h-8 px-2.5 rounded-md border border-gray-200 hover:border-gray-900 hover:bg-gray-50 text-[10px] font-bold uppercase tracking-wide text-gray-700 transition-colors"
+              >
+                <Copy size={12} strokeWidth={2.5} />
+                Clone
+              </button>
+              <Link
+                to={`/projects/${encodeURIComponent(p.name)}`}
+                className="text-gray-400 hover:text-gray-900 transition-colors"
+                aria-label={`Open ${p.name}`}
+              >
+                <ArrowRight size={16} strokeWidth={2.5} />
+              </Link>
             </div>
-          </Link>
+          </div>
         ))}
       </div>
+
+      {cloneSource && (
+        <CloneModal source={cloneSource} onClose={() => { setCloneSource(null); void load(); }} />
+      )}
 
       <button
         onClick={load}

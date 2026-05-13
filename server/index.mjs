@@ -39,6 +39,15 @@ if (!TOKEN) {
   console.warn('[qcontrol] QCONTROL_TOKEN not set — the UI will refuse every request. Set it in .env before going live.');
 }
 
+// Git "safe.directory" — when /opt is owned by root on the host and this
+// container runs as a different uid, git 2.35+ refuses to operate on those
+// repos with "fatal: detected dubious ownership". Without this, branch +
+// last-commit detection silently fail for every host-owned repo. Allow
+// every path; we only ever read, never mutate (clone uses fresh dirs).
+try {
+  await execFileP('git', ['config', '--global', '--add', 'safe.directory', '*'], { timeout: 3000 });
+} catch { /* ignore — not fatal if git is missing in dev */ }
+
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.use(cookieParser());
@@ -114,19 +123,55 @@ async function listProjects() {
 
 app.get('/api/projects', authed, async (_req, res) => {
   const projects = await listProjects();
-  // Also attach running-container status via `docker ps` once and match by
-  // compose-project label (the directory name).
-  let runningProjects = new Set();
+
+  // Running detection — authoritative version. We read TWO docker labels at
+  // once and match on either:
+  //   • `com.docker.compose.project`            — usually the directory name,
+  //     but operators sometimes override it via `name:` in compose.yml or
+  //     COMPOSE_PROJECT_NAME, which is why label-only matching missed e.g.
+  //     /opt/faceapp_main → containers labelled "faceapp".
+  //   • `com.docker.compose.project.working_dir` — the absolute path of the
+  //     project's compose file dir on the host. This is the unambiguous
+  //     anchor: if any running container's working_dir matches our project's
+  //     host path, that project is up regardless of how its name was set.
+  // Containers report HOST paths (the daemon is on the host), so we compare
+  // against the canonical host paths derived from HOST_OPT mount point.
+  const runningNames = new Set();      // exact project-name match
+  const runningHostPaths = new Set();  // absolute host paths
   try {
     const { stdout } = await execFileP(
       'docker',
-      ['ps', '--format', '{{.Label "com.docker.compose.project"}}'],
+      ['ps', '--format', '{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.project.working_dir"}}'],
       { timeout: 5000 },
     );
-    runningProjects = new Set(stdout.split('\n').map((s) => s.trim()).filter(Boolean));
-  } catch { /* docker offline — annotate everything as unknown */ }
+    for (const line of stdout.split('\n')) {
+      const [name, wd] = line.split('|');
+      if (name && name.trim()) runningNames.add(name.trim());
+      if (wd && wd.trim()) runningHostPaths.add(wd.trim().replace(/\/+$/, ''));
+    }
+  } catch { /* docker offline — leave every project marked stopped */ }
 
-  for (const p of projects) p.running = runningProjects.has(p.name);
+  // Translate /host/opt/<x> back to whatever absolute host path docker
+  // reports. Common cases: HOST_OPT="/host/opt" → host path "/opt"; for any
+  // other mount we just strip the container-side prefix and pop a leading
+  // "/opt" guess; we also keep the original prefixed path as a fallback in
+  // case the bind mount uses identical paths on both sides.
+  function hostPathFor(project) {
+    const containerPath = project.path; // e.g. /host/opt/qparking
+    const candidates = new Set([containerPath]);
+    if (HOST_OPT.startsWith('/host')) candidates.add(containerPath.replace(/^\/host/, ''));
+    return candidates;
+  }
+
+  for (const p of projects) {
+    let running = runningNames.has(p.name);
+    if (!running) {
+      for (const candidate of hostPathFor(p)) {
+        if (runningHostPaths.has(candidate.replace(/\/+$/, ''))) { running = true; break; }
+      }
+    }
+    p.running = running;
+  }
   res.json({ data: projects });
 });
 
@@ -214,6 +259,192 @@ app.post('/api/projects/:name/down', authed, async (req, res) => {
     const { stdout, stderr } = await runCompose(req.params.name, ['down']);
     res.json({ ok: true, log: stdout + stderr });
   } catch (e) { res.status(500).json({ error: 'compose_error', message: e.stderr || e.message }); }
+});
+
+// ─── clone-to-staging ───────────────────────────────────────────────────
+
+/** Slug-safe identifier (a-z 0-9 dash). Used for derived dest name suffix. */
+function slugify(input) {
+  return String(input || '').toLowerCase().trim().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
+/** Scan the reverse-proxy .env, the Caddyfile, every project's
+ *  docker-compose.vps.yml, and the running docker container port
+ *  publications — return the union of ports already in use so we don't
+ *  double-allocate when picking a port for a new staging clone. */
+async function collectUsedPorts() {
+  const used = new Set();
+
+  try {
+    const envBody = await readFile(path.join(REVERSE_PROXY_DIR, '.env'), 'utf8');
+    for (const m of envBody.matchAll(/127\.0\.0\.1:(\d{2,5})/g)) used.add(Number(m[1]));
+  } catch { /* ignore */ }
+  try {
+    const cf = await readFile(path.join(REVERSE_PROXY_DIR, 'Caddyfile'), 'utf8');
+    for (const m of cf.matchAll(/127\.0\.0\.1:(\d{2,5})/g)) used.add(Number(m[1]));
+  } catch { /* ignore */ }
+
+  try {
+    const entries = await readdir(HOST_OPT, { withFileTypes: true });
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      const overlay = path.join(HOST_OPT, e.name, 'docker-compose.vps.yml');
+      if (!existsSync(overlay)) continue;
+      try {
+        const body = await readFile(overlay, 'utf8');
+        for (const m of body.matchAll(/127\.0\.0\.1:(\d{2,5})/g)) used.add(Number(m[1]));
+      } catch { /* ignore */ }
+    }
+  } catch { /* ignore */ }
+
+  try {
+    const { stdout } = await execFileP('docker', ['ps', '--format', '{{.Ports}}'], { timeout: 5000 });
+    for (const m of stdout.matchAll(/(?:127\.0\.0\.1:)?(\d{2,5})->/g)) used.add(Number(m[1]));
+  } catch { /* docker offline — fine */ }
+
+  return used;
+}
+
+/** Walk forward from start, return the first port not in `used`. */
+function nextFreePort(used, start = 8088) {
+  for (let p = start; p < 9000; p++) if (!used.has(p)) return p;
+  throw new Error('No free port in 8088-8999');
+}
+
+app.get('/api/projects/:name/clone-info', authed, async (req, res) => {
+  const project = req.params.name;
+  const dir = path.join(HOST_OPT, project);
+  if (!existsSync(dir)) return res.status(404).json({ error: 'no_such_project' });
+
+  let gitRemote = null;
+  let branches = [];
+  try {
+    const r = await execFileP('git', ['-C', dir, 'remote', 'get-url', 'origin'], { timeout: 3000 });
+    gitRemote = r.stdout.trim();
+  } catch { /* not a git repo */ }
+  try {
+    const r = await execFileP('git', ['-C', dir, 'for-each-ref', '--format=%(refname:short)', 'refs/remotes/origin'], { timeout: 3000 });
+    branches = r.stdout.split('\n').map((s) => s.trim()).filter(Boolean)
+      .map((b) => b.replace(/^origin\//, '')).filter((b) => b !== 'HEAD');
+  } catch { /* ignore */ }
+
+  const used = await collectUsedPorts();
+  const suggestedPort = nextFreePort(used);
+
+  res.json({
+    source: project,
+    gitRemote,
+    branches,
+    suggestedDest: `${project}-staging`,
+    suggestedPort,
+    usedPorts: Array.from(used).sort((a, b) => a - b),
+  });
+});
+
+app.post('/api/projects/clone', authed, async (req, res) => {
+  const {
+    source,
+    dest: rawDest,
+    method = 'git',           // 'git' or 'copy'
+    branch,                   // required when method=git
+    domain,                   // optional — when set, we wire reverse-proxy
+    port: rawPort,            // optional — auto-allocate when missing
+    reloadCaddy = true,
+  } = req.body || {};
+
+  const log = [];
+  const push = (line) => log.push(line);
+
+  if (!source || typeof source !== 'string') return res.status(400).json({ error: 'source_required' });
+  const dest = slugify(rawDest || `${source}-staging`);
+  if (!dest) return res.status(400).json({ error: 'dest_required' });
+
+  const srcDir = path.join(HOST_OPT, source);
+  const destDir = path.join(HOST_OPT, dest);
+  if (!existsSync(srcDir)) return res.status(404).json({ error: 'no_such_source' });
+  if (existsSync(destDir)) return res.status(409).json({ error: 'dest_exists', message: `${destDir} already exists` });
+
+  let port = Number(rawPort);
+  if (!Number.isFinite(port) || port < 1024 || port > 65535) {
+    const used = await collectUsedPorts();
+    port = nextFreePort(used);
+    push(`==> Auto-allocated port: ${port}`);
+  }
+
+  // 1) Copy or clone the project tree.
+  try {
+    if (method === 'git') {
+      const remoteResult = await execFileP('git', ['-C', srcDir, 'remote', 'get-url', 'origin'], { timeout: 3000 });
+      const remote = remoteResult.stdout.trim();
+      if (!remote) throw new Error('source has no git remote — switch to copy mode');
+      const targetBranch = branch || 'main';
+      push(`==> git clone ${remote} -b ${targetBranch} → ${destDir}`);
+      const r = await execFileP('git', ['clone', '--branch', targetBranch, '--single-branch', remote, destDir], { timeout: 5 * 60 * 1000 });
+      push(r.stdout + r.stderr);
+    } else if (method === 'copy') {
+      push(`==> cp -r ${srcDir} → ${destDir}`);
+      try {
+        const r = await execFileP('rsync', ['-a', '--exclude', '.git', '--exclude', 'node_modules', '--exclude', 'vendor', '--exclude', 'data', `${srcDir}/`, `${destDir}/`], { timeout: 10 * 60 * 1000 });
+        push(r.stdout + r.stderr || '(rsync ok)');
+      } catch {
+        const r = await execFileP('cp', ['-r', srcDir, destDir], { timeout: 10 * 60 * 1000 });
+        push(r.stdout + r.stderr || '(cp ok)');
+      }
+    } else {
+      return res.status(400).json({ error: 'bad_method', message: 'method must be git or copy' });
+    }
+  } catch (e) {
+    push('✗ ' + (e.stderr || e.message));
+    return res.status(500).json({ ok: false, log: log.join('\n') });
+  }
+
+  // 2) Optionally wire reverse-proxy: append .env vars + Caddyfile block, validate, reload.
+  let proxyDetails = null;
+  if (domain) {
+    const slug = slugify(dest).toUpperCase().replace(/-/g, '_');
+    const envLine1 = `${slug}_DOMAIN=${domain}`;
+    const envLine2 = `${slug}_UPSTREAM=127.0.0.1:${port}`;
+    const caddyBlock = `{$${slug}_DOMAIN} {\n  reverse_proxy {$${slug}_UPSTREAM}\n}\n`;
+
+    try {
+      const envPath = path.join(REVERSE_PROXY_DIR, '.env');
+      const caddyPath = path.join(REVERSE_PROXY_DIR, 'Caddyfile');
+      const existingEnv = (await readFile(envPath, 'utf8').catch(() => '')) || '';
+      const newEnv = existingEnv.replace(/\s*$/, '') + `\n\n# ${dest}\n${envLine1}\n${envLine2}\n`;
+      await writeFile(envPath, newEnv, 'utf8');
+      push('==> appended to /opt/reverse-proxy/.env');
+
+      const existingCaddy = await readFile(caddyPath, 'utf8');
+      await writeFile(caddyPath, existingCaddy.replace(/\s*$/, '') + '\n\n' + caddyBlock, 'utf8');
+      push('==> appended to /opt/reverse-proxy/Caddyfile');
+
+      if (reloadCaddy) {
+        try {
+          const v = await execP('docker compose -f docker-compose.yml exec -T caddy caddy validate --config /etc/caddy/Caddyfile', { cwd: REVERSE_PROXY_DIR, timeout: 30000 });
+          push('==> caddy validate ok');
+          push(v.stdout + v.stderr);
+          const r = await execP('docker compose -f docker-compose.yml exec -T caddy caddy reload --config /etc/caddy/Caddyfile', { cwd: REVERSE_PROXY_DIR, timeout: 30000 });
+          push('==> caddy reload ok');
+          push(r.stdout + r.stderr);
+        } catch (e) {
+          push('✗ caddy validate/reload failed: ' + (e.stderr || e.message));
+          push('   (.env and Caddyfile were still written — fix the syntax and reload manually)');
+        }
+      }
+      proxyDetails = { domain, port, envKey: slug };
+    } catch (e) {
+      push('✗ reverse-proxy wire-up failed: ' + e.message);
+    }
+  }
+
+  res.json({
+    ok: true,
+    dest,
+    destDir,
+    port,
+    proxy: proxyDetails,
+    log: log.join('\n'),
+  });
 });
 
 // ─── reverse-proxy editor ────────────────────────────────────────────────

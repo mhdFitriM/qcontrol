@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { CheckCircle2, Loader2, RefreshCw, ShieldCheck, AlertTriangle } from 'lucide-react';
+import { CheckCircle2, Loader2, RefreshCw, ShieldCheck, AlertTriangle, RotateCw } from 'lucide-react';
 import { api } from '../lib/api';
 
 type Tab = 'env' | 'caddy';
@@ -12,6 +12,7 @@ export function ReverseProxy() {
   const [saving, setSaving] = useState<null | 'env' | 'caddy'>(null);
   const [validating, setValidating] = useState(false);
   const [reloading, setReloading] = useState(false);
+  const [recreating, setRecreating] = useState(false);
   const [toast, setToast] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
 
   useEffect(() => {
@@ -63,6 +64,16 @@ export function ReverseProxy() {
     } finally { setReloading(false); }
   }
 
+  async function recreate() {
+    setRecreating(true);
+    try {
+      await api.post<{ ok: boolean; log: string }>('/revproxy/recreate');
+      flash('ok', 'Caddy container recreated — new .env vars are now live');
+    } catch (e: any) {
+      flash('err', e?.body?.log || 'Recreate failed');
+    } finally { setRecreating(false); }
+  }
+
   if (!loaded) {
     return <div className="py-12 flex items-center justify-center"><Loader2 size={24} className="animate-spin text-gray-400" /></div>;
   }
@@ -91,10 +102,11 @@ export function ReverseProxy() {
           ))}
         </div>
 
-        <div className="ml-auto flex items-center gap-2">
+        <div className="ml-auto flex items-center gap-2 flex-wrap">
           <button
             onClick={validate}
             disabled={validating}
+            title="Run `caddy validate` inside the running container — no side-effects."
             className="inline-flex items-center gap-1.5 h-9 px-3 rounded-lg border border-gray-200 bg-white text-xs font-semibold uppercase tracking-wide text-gray-700 hover:border-gray-900 transition-colors disabled:opacity-50"
           >
             {validating ? <Loader2 size={13} className="animate-spin" /> : <ShieldCheck size={13} strokeWidth={2.5} />}
@@ -103,10 +115,20 @@ export function ReverseProxy() {
           <button
             onClick={reload}
             disabled={reloading}
+            title="Validate, then `caddy reload` — zero downtime, picks up Caddyfile edits."
             className="inline-flex items-center gap-1.5 h-9 px-3.5 rounded-lg bg-gray-900 hover:bg-gray-800 text-white text-xs font-semibold uppercase tracking-wide transition-colors disabled:opacity-50"
           >
             {reloading ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} strokeWidth={2.5} />}
             Validate &amp; reload Caddy
+          </button>
+          <button
+            onClick={recreate}
+            disabled={recreating}
+            title="Recreate the Caddy container so new .env vars take effect. ~1s of downtime. Required after adding new *_DOMAIN / *_UPSTREAM pairs."
+            className="inline-flex items-center gap-1.5 h-9 px-3.5 rounded-lg border-2 border-amber-300 bg-amber-50 hover:bg-amber-100 text-amber-900 text-xs font-semibold uppercase tracking-wide transition-colors disabled:opacity-50"
+          >
+            {recreating ? <Loader2 size={13} className="animate-spin" /> : <RotateCw size={13} strokeWidth={2.5} />}
+            Apply .env changes (recreate Caddy)
           </button>
         </div>
       </div>
@@ -172,8 +194,10 @@ function Editor({
         {saving && <Loader2 size={14} className="animate-spin" />}
         Save (no reload)
       </button>
-      <p className="text-[11px] text-gray-500">
-        Save writes to disk only. The new config takes effect when you click <em>Validate &amp; reload Caddy</em> above — Caddy validates first and only swaps if green, so a typo can't take every site down.
+      <p className="text-[11px] text-gray-500 leading-relaxed">
+        Save writes to disk only. Then apply with one of the buttons above —
+        <strong> Validate &amp; reload Caddy</strong> for Caddyfile-only edits (zero downtime),
+        or <strong>Apply .env changes (recreate Caddy)</strong> when you've added a new <code>*_DOMAIN</code> / <code>*_UPSTREAM</code> pair (~1s of downtime — required because Caddy reads <code>{`{$VAR}`}</code> env references only at container startup).
       </p>
     </div>
   );

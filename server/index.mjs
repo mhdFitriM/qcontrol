@@ -419,16 +419,30 @@ app.post('/api/projects/clone', authed, async (req, res) => {
       push('==> appended to /opt/reverse-proxy/Caddyfile');
 
       if (reloadCaddy) {
+        // IMPORTANT: Caddy reads {$VAR} env-var references ONCE at container
+        // startup, not on `caddy reload`. Since the clone just appended a
+        // brand-new *_DOMAIN / *_UPSTREAM pair to .env, a plain reload would
+        // expand them to empty strings, producing a `<empty> { ... }` block
+        // that Caddy treats as a global options block (must be first) and
+        // refuses with "server block without any key is global configuration".
+        // The reliable path is to recreate the Caddy container so it re-reads
+        // .env from disk. ~1 second of downtime; acceptable.
         try {
-          const v = await execP('docker compose -f docker-compose.yml exec -T caddy caddy validate --config /etc/caddy/Caddyfile', { cwd: REVERSE_PROXY_DIR, timeout: 30000 });
+          const r = await execP(
+            'docker compose -f docker-compose.yml up -d --force-recreate caddy',
+            { cwd: REVERSE_PROXY_DIR, timeout: 60000 },
+          );
+          push('==> caddy recreated with fresh env');
+          push(r.stdout + r.stderr);
+          const v = await execP(
+            'docker compose -f docker-compose.yml exec -T caddy caddy validate --config /etc/caddy/Caddyfile',
+            { cwd: REVERSE_PROXY_DIR, timeout: 30000 },
+          );
           push('==> caddy validate ok');
           push(v.stdout + v.stderr);
-          const r = await execP('docker compose -f docker-compose.yml exec -T caddy caddy reload --config /etc/caddy/Caddyfile', { cwd: REVERSE_PROXY_DIR, timeout: 30000 });
-          push('==> caddy reload ok');
-          push(r.stdout + r.stderr);
         } catch (e) {
-          push('✗ caddy validate/reload failed: ' + (e.stderr || e.message));
-          push('   (.env and Caddyfile were still written — fix the syntax and reload manually)');
+          push('✗ caddy recreate/validate failed: ' + (e.stderr || e.message));
+          push('   (.env and Caddyfile were still written — fix the syntax and rerun manually)');
         }
       }
       proxyDetails = { domain, port, envKey: slug };
@@ -512,6 +526,32 @@ app.post('/api/revproxy/reload', authed, async (_req, res) => {
     res.json({ ok: true, log: stdout + stderr });
   } catch (e) {
     res.status(500).json({ ok: false, error: 'reload_failed', log: e.stdout + e.stderr });
+  }
+});
+
+app.post('/api/revproxy/recreate', authed, async (_req, res) => {
+  // Use this after editing .env (new *_DOMAIN / *_UPSTREAM vars). Caddy only
+  // re-reads its `{$VAR}` expansions at container startup, so adding a brand
+  // new var requires a recreate, not a reload. ~1 second of TLS downtime.
+  try {
+    const { stdout, stderr } = await execP(
+      'docker compose -f docker-compose.yml up -d --force-recreate caddy',
+      { cwd: REVERSE_PROXY_DIR, timeout: 60000 },
+    );
+    // After recreate, validate to surface any non-env Caddyfile errors.
+    let validateLog = '';
+    try {
+      const v = await execP(
+        'docker compose -f docker-compose.yml exec -T caddy caddy validate --config /etc/caddy/Caddyfile',
+        { cwd: REVERSE_PROXY_DIR, timeout: 30000 },
+      );
+      validateLog = v.stdout + v.stderr;
+    } catch (e) {
+      return res.status(400).json({ ok: false, error: 'caddy_invalid_after_recreate', log: stdout + stderr + '\n' + (e.stdout + e.stderr) });
+    }
+    res.json({ ok: true, log: stdout + stderr + '\n' + validateLog });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: 'recreate_failed', log: (e.stdout || '') + (e.stderr || e.message) });
   }
 });
 

@@ -1,0 +1,14 @@
+## VPS override — bind qcontrol only on 127.0.0.1.
+## The shared reverse proxy in /opt/reverse-proxy terminates TLS and
+## fans qcontrol.{your-domain} into 127.0.0.1:8089.
+##
+## Usage:
+##   cd /opt/qcontrol
+##   cp .env.vps.example .env
+##   nano .env   # set QCONTROL_TOKEN to a long random string
+##   docker compose -f docker-compose.yml -f docker-compose.vps.yml up -d --build
+
+services:
+  qcontrol:
+    ports: !override
+      - "127.0.0.1:${QCONTROL_PORT:-8089}:8089"

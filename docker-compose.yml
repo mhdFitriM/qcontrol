@@ -1,0 +1,17 @@
+services:
+  qcontrol:
+    build: .
+    container_name: qcontrol
+    restart: unless-stopped
+    environment:
+      QCONTROL_TOKEN: ${QCONTROL_TOKEN:?set in .env}
+      HOST_OPT: /host/opt
+      PORT: 8089
+    volumes:
+      # Docker socket — qcontrol shells out to the host's docker CLI through this.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # The host's /opt directory, where every project lives. Read-write so
+      # the reverse-proxy editor + (future) staging-clone can update files.
+      - /opt:/host/opt
+    ports:
+      - "8089:8089"

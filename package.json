@@ -1,0 +1,20 @@
+{
+  "name": "qcontrol",
+  "private": true,
+  "version": "0.1.0",
+  "description": "VPS control panel — manage all /opt docker projects and the shared reverse-proxy from a browser, no SSH needed.",
+  "type": "module",
+  "scripts": {
+    "build": "cd web && npm install && npm run build",
+    "start": "node server/index.mjs",
+    "dev:server": "node --watch server/index.mjs",
+    "dev:web": "cd web && npm run dev"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "cookie-parser": "^1.4.7"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

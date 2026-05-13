@@ -1,0 +1,40 @@
+name: Deploy qcontrol to VPS
+
+# Same SSH-deploy pattern as the rest of Qbot_Main.
+# Secrets needed (Settings → Secrets and variables → Actions):
+#   VPS_HOST, VPS_USER, VPS_SSH_KEY, optional VPS_PORT.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: qcontrol-vps
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          script_stop: true
+          command_timeout: 20m
+          script: |
+            set -e
+            cd /opt/qcontrol
+            git fetch --all --prune
+            git reset --hard origin/main
+            git log -1 --pretty=format:"%h %s (%an, %ar)"
+            COMPOSE="docker compose -f docker-compose.yml -f docker-compose.vps.yml"
+            $COMPOSE build --no-cache
+            $COMPOSE up -d --force-recreate --remove-orphans
+            docker image prune -f
+            $COMPOSE ps

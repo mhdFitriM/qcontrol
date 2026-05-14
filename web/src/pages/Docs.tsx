@@ -138,6 +138,42 @@ ufw --force enable
 ufw status`,
       },
       {
+        title: 'Create the SFTP user (chrooted to /opt)',
+        body: 'A dedicated sftpuser with password auth, chrooted to /opt so they can only see project folders — not /etc, /root, or anything else. Mirrors what we have on the prod VPS. Use this account for WinSCP/FileZilla file transfers; never share root credentials.',
+        cmd: `# 1. Create the user — no shell so they can ONLY sftp, not ssh:
+useradd -m -d /home/sftpuser -s /usr/sbin/nologin sftpuser
+echo "sftpuser:<choose-a-strong-password>" | chpasswd
+
+# 2. Chroot requires /opt to be root-owned + not group/world writable:
+chown root:root /opt
+chmod 755 /opt
+
+# 3. Group sftpuser write access to project subdirs:
+groupadd -f sftpusers
+usermod -aG sftpusers sftpuser
+
+# Grant write on every project dir that exists at this point:
+for d in /opt/reverse-proxy /opt/qcontrol /opt/project_qbotu_a3; do
+  [ -d "$d" ] && chgrp -R sftpusers "$d" && chmod -R g+rwX "$d" && chmod g+s "$d"
+done
+# g+s on the parent makes new files inherit the sftpusers group, so future
+# qcontrol/git/whatever creates files that sftpuser can still edit.
+
+# 4. SSH/SFTP chroot dropin (keeps the change isolated, easy to remove):
+cat > /etc/ssh/sshd_config.d/10-sftpuser.conf <<'EOF'
+Match User sftpuser
+    ChrootDirectory /opt
+    ForceCommand internal-sftp
+    AllowTcpForwarding no
+    X11Forwarding no
+    PasswordAuthentication yes
+EOF
+
+# 5. Validate + reload sshd — validation exits non-zero if there's a typo:
+sshd -t && systemctl restart sshd`,
+        note: 'Inside sftpuser\'s session, `/` is actually /opt on the host. Test from your laptop with WinSCP (Protocol: SFTP, Host: <vps-ip>, User: sftpuser, Password: <the one you set>) — you should land in a directory that lists the project folders and CANNOT cd above them. Repeat the chgrp + chmod g+rwX step for every new /opt/<project> you add later.',
+      },
+      {
         title: 'SSH deploy key for private GitHub repos',
         body: 'qcontrol\'s Pull + rebuild uses this key when running git pull against private repos. Generate, then add the public half as a Deploy Key on each private repo (Settings → Deploy keys → Add).',
         cmd: `ssh-keygen -t ed25519 -C "staging-vps-deploy" -f ~/.ssh/id_ed25519 -N ""
@@ -326,6 +362,20 @@ git fetch --all --prune
 git reset --hard origin/main
 ./deploy-vps.sh`,
         note: 'The script automatically takes a pre-deploy backup unless one ran in the last 4 hours. To force a fresh backup: `./deploy-vps.sh --fresh-backup`.',
+      },
+      {
+        title: 'First deploy on a fresh VPS — build face-recognition first',
+        body: 'deploy-vps.sh\'s --full-build only rebuilds a hardcoded list of services (bootstrap, frontend-static, backup, minio-restore). face-recognition is NOT in that list, but the production stack depends on the project_qbotu_a3_prod-face-recognition:latest image. On a fresh VPS that image doesn\'t exist yet — and because the script runs `docker compose up -d --no-build`, compose can\'t build it on the fly. Result: deploy fails with "No such image: project_qbotu_a3_prod-face-recognition:latest". Prod doesn\'t hit this because the image was built once long ago and has been cached ever since.',
+        cmd: `cd /opt/project_qbotu_a3
+
+# Build the missing image manually (5–15 min — it's the heaviest in the stack):
+COMPOSE_PROJECT_NAME=project_qbotu_a3_prod docker compose \\
+  -f docker-compose.production.yml -f docker-compose.vps.yml \\
+  build face-recognition
+
+# Now the regular deploy can finish:
+./deploy-vps.sh`,
+        note: 'Long-term fix: patch deploy-vps.sh\'s `build_services=(bootstrap frontend-static backup minio-restore)` line to include `face-recognition` and commit it. Then this trap never bites again — neither on staging nor on a future prod-rebuild-from-scratch.',
       },
       {
         title: 'Full rebuild — after Dockerfile or dependency changes',

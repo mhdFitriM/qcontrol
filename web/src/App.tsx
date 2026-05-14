@@ -1,6 +1,6 @@
 import { Navigate, NavLink, Outlet, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
-import { useEffect, useState } from 'react';
-import { Activity, BookOpen, Boxes, Globe, LogOut, Menu, ServerCog, X } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import { Activity, BookOpen, Boxes, ChevronDown, Globe, LogOut, Menu, ServerCog, X } from 'lucide-react';
 import { api } from './lib/api';
 import { Login } from './pages/Login';
 import { Projects } from './pages/Projects';
@@ -84,6 +84,7 @@ function Shell() {
       {/* Desktop sidebar — persistent, only visible md+ */}
       <aside className="hidden md:flex flex-col w-60 bg-gray-950 text-white flex-shrink-0">
         <SidebarBrand />
+        <VpsSwitcher />
         <SidebarNav onLogout={logout} />
       </aside>
 
@@ -106,6 +107,7 @@ function Shell() {
                 <X size={18} strokeWidth={2.25} />
               </button>
             </div>
+            <VpsSwitcher />
             <SidebarNav onLogout={logout} />
           </aside>
         </div>
@@ -129,6 +131,72 @@ function SidebarBrand() {
         <div className="text-sm font-bold tracking-tight">qcontrol</div>
         <div className="text-[10px] text-white/40 uppercase tracking-widest">VPS panel</div>
       </div>
+    </div>
+  );
+}
+
+interface Peer { name: string; url: string; }
+
+function VpsSwitcher() {
+  const [self, setSelf] = useState<string>('this vps');
+  const [peers, setPeers] = useState<Peer[]>([]);
+  const [open, setOpen] = useState(false);
+  const wrapRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    fetch('/api/peers')
+      .then((r) => r.json())
+      .then((d) => { setSelf(d.self || 'this vps'); setPeers(Array.isArray(d.peers) ? d.peers : []); })
+      .catch(() => { /* ignore — switcher just won't appear */ });
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDocClick = (e: MouseEvent) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', onDocClick);
+    return () => document.removeEventListener('mousedown', onDocClick);
+  }, [open]);
+
+  // Hide entirely if there's nothing to switch to.
+  if (peers.length <= 1) return null;
+
+  return (
+    <div ref={wrapRef} className="relative px-3 py-3 border-b border-white/10 flex-shrink-0">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="w-full flex items-center gap-2 px-3 h-10 rounded-lg bg-white/5 hover:bg-white/10 text-white/90 text-xs transition-colors"
+      >
+        <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0" />
+        <span className="text-[10px] uppercase tracking-widest text-white/40 font-bold">VPS</span>
+        <span className="font-semibold truncate flex-1 text-left">{self}</span>
+        <ChevronDown size={14} strokeWidth={2.5} className={`text-white/40 transition-transform ${open ? 'rotate-180' : ''}`} />
+      </button>
+      {open && (
+        <div className="absolute left-3 right-3 mt-1 z-30 rounded-lg bg-gray-900 border border-white/10 shadow-2xl overflow-hidden">
+          {peers.map((p) => {
+            const isSelf = p.name === self;
+            return (
+              <a
+                key={p.name}
+                href={isSelf ? undefined : p.url}
+                onClick={isSelf ? (e) => { e.preventDefault(); setOpen(false); } : undefined}
+                className={`flex items-center gap-2 px-3 h-9 text-xs transition-colors ${
+                  isSelf
+                    ? 'bg-white/5 text-white/90 cursor-default'
+                    : 'text-white/70 hover:bg-white/10 hover:text-white'
+                }`}
+              >
+                <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${isSelf ? 'bg-emerald-400' : 'bg-white/30'}`} />
+                <span className="font-semibold truncate flex-1">{p.name}</span>
+                {isSelf && <span className="text-[9px] uppercase tracking-widest text-white/40">current</span>}
+              </a>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }

@@ -1,12 +1,29 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
-import { ArrowLeft, Loader2, Play, RefreshCw, Square, Hammer, ScrollText, Trash2, AlertTriangle, Terminal } from 'lucide-react';
+import { ArrowLeft, Loader2, Play, RefreshCw, Square, Hammer, ScrollText, Trash2, AlertTriangle, Terminal, Download } from 'lucide-react';
 import { api } from '../lib/api';
+import { ConfirmActionModal } from '../components/ConfirmActionModal';
 
 interface Container { name: string; status: string; state: string; ports: string; image: string; }
 interface ContainersResp { data: Container[]; running: boolean; total: number; runningCount: number; }
 
 type OutputTab = 'output' | 'logs';
+
+interface PendingAction {
+  label: string;
+  path: string;
+  icon: any;
+  danger?: boolean;
+  needsGit?: boolean;
+}
+
+const ACTIONS: PendingAction[] = [
+  { label: 'Restart',         path: 'restart',          icon: RefreshCw },
+  { label: 'Up',              path: 'up',               icon: Play },
+  { label: 'Rebuild',         path: 'rebuild',          icon: Hammer },
+  { label: 'Pull + Rebuild',  path: 'pull-and-rebuild', icon: Download, needsGit: true },
+  { label: 'Down',            path: 'down',             icon: Square, danger: true },
+];
 
 export function ProjectDetail() {
   const { name = '' } = useParams();
@@ -20,6 +37,8 @@ export function ProjectDetail() {
   const [outputTab, setOutputTab] = useState<OutputTab>('output');
   const [loading, setLoading] = useState(true);
   const [removeOpen, setRemoveOpen] = useState(false);
+  const [pending, setPending] = useState<PendingAction | null>(null);
+  const outputRef = useRef<HTMLPreElement>(null);
 
   async function loadContainers() {
     setLoading(true);
@@ -27,10 +46,6 @@ export function ProjectDetail() {
       const r = await api.get<ContainersResp>(`/projects/${encodeURIComponent(name)}/containers`);
       setContainers(r.data);
       setStats({ running: r.running, total: r.total, runningCount: r.runningCount });
-      // Auto-load logs whenever the stack isn't fully up. Big help when
-      // diagnosing a "why isn't this running" situation — the user opens
-      // the page and immediately sees the failing container's last 200
-      // lines without having to click anything.
       if (r.total > 0 && r.runningCount < r.total) {
         void loadLogs();
         setOutputTab('logs');
@@ -40,15 +55,41 @@ export function ProjectDetail() {
   }
   useEffect(() => { void loadContainers(); }, [name]);
 
-  async function action(label: string, path: string) {
-    setBusy(label);
-    setOutput(`> ${label}…\n`);
+  /**
+   * Stream an action's output from the server as it's produced. Uses fetch's
+   * ReadableStream so each chunk of stdout/stderr appears in the terminal
+   * pane immediately — no waiting for the whole command to finish.
+   */
+  async function runAction(a: PendingAction) {
+    setBusy(a.label);
+    setOutput('');
     setOutputTab('output');
     try {
-      const r = await api.post<{ ok: boolean; log: string }>(`/projects/${encodeURIComponent(name)}/${path}`);
-      setOutput((cur) => cur + (r.log || '(no output)') + '\n\n✓ done');
+      const res = await fetch(`/api${`/projects/${encodeURIComponent(name)}/${a.path}`}`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      });
+      if (res.status === 401) { location.href = '/login'; return; }
+      if (!res.body) {
+        setOutput('(no response stream — server may be unreachable)');
+        return;
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value, { stream: true });
+        setOutput((cur) => cur + chunk);
+        // Autoscroll to bottom as new output arrives.
+        requestAnimationFrame(() => {
+          if (outputRef.current) outputRef.current.scrollTop = outputRef.current.scrollHeight;
+        });
+      }
     } catch (e: any) {
-      setOutput((cur) => cur + '\n✗ ' + (e?.body?.message || e.message || String(e)));
+      setOutput((cur) => cur + '\n[qcontrol] ✗ stream failed: ' + (e.message || String(e)) + '\n');
     } finally {
       setBusy(null);
       void loadContainers();
@@ -77,11 +118,17 @@ export function ProjectDetail() {
       <p className="mt-1 text-sm text-gray-500">Path: <code className="text-xs">/opt/{name}</code></p>
 
       <div className="mt-5 grid grid-cols-2 sm:grid-cols-5 gap-2">
-        <ActionButton onClick={() => action('Restart', 'restart')} busy={busy === 'Restart'} icon={RefreshCw} label="Restart" />
-        <ActionButton onClick={() => action('Up', 'up')} busy={busy === 'Up'} icon={Play} label="Up" />
-        <ActionButton onClick={() => action('Rebuild', 'rebuild')} busy={busy === 'Rebuild'} icon={Hammer} label="Rebuild" />
-        <ActionButton onClick={() => action('Pull + Rebuild', 'pull-and-rebuild')} busy={busy === 'Pull + Rebuild'} icon={Hammer} label="Pull + rebuild" />
-        <ActionButton onClick={() => action('Down', 'down')} busy={busy === 'Down'} icon={Square} label="Down" danger />
+        {ACTIONS.map((a) => (
+          <ActionButton
+            key={a.path}
+            onClick={() => setPending(a)}
+            busy={busy === a.label}
+            disabled={!!busy && busy !== a.label}
+            icon={a.icon}
+            label={a.label}
+            danger={a.danger}
+          />
+        ))}
       </div>
 
       <section className="mt-6">
@@ -134,7 +181,10 @@ export function ProjectDetail() {
           )}
         </div>
         {outputTab === 'output' ? (
-          <pre className="rounded-xl border border-gray-200 bg-gray-900 text-green-200 p-4 text-xs leading-snug font-mono whitespace-pre-wrap break-all max-h-96 overflow-y-auto">
+          <pre
+            ref={outputRef}
+            className="rounded-xl border border-gray-200 bg-gray-900 text-green-200 p-4 text-xs leading-snug font-mono whitespace-pre-wrap break-all max-h-96 overflow-y-auto"
+          >
             {output || '(no output yet — pick an action above)'}
           </pre>
         ) : (
@@ -174,6 +224,23 @@ export function ProjectDetail() {
           project={name}
           onClose={() => setRemoveOpen(false)}
           onRemoved={() => navigate('/projects', { replace: true })}
+        />
+      )}
+
+      {pending && (
+        <ConfirmActionModal
+          title={`${pending.label} — ${name}`}
+          description={`Review the plan below, then type "confirm" to execute.`}
+          project={name}
+          needsGit={pending.needsGit}
+          danger={pending.danger}
+          confirmLabel={pending.label}
+          onClose={() => setPending(null)}
+          onConfirm={() => {
+            const action = pending;
+            setPending(null);
+            void runAction(action);
+          }}
         />
       )}
     </div>
@@ -367,14 +434,14 @@ function StatusBadge({
 }
 
 function ActionButton({
-  onClick, busy, icon: Icon, label, danger,
-}: { onClick: () => void; busy: boolean; icon: any; label: string; danger?: boolean }) {
-  const base = 'inline-flex items-center justify-center gap-1.5 h-10 rounded-lg text-xs font-semibold uppercase tracking-wide transition-colors disabled:opacity-50';
+  onClick, busy, disabled, icon: Icon, label, danger,
+}: { onClick: () => void; busy: boolean; disabled?: boolean; icon: any; label: string; danger?: boolean }) {
+  const base = 'inline-flex items-center justify-center gap-1.5 h-10 rounded-lg text-xs font-semibold uppercase tracking-wide transition-colors disabled:opacity-40 disabled:cursor-not-allowed';
   const cls = danger
     ? 'border border-red-200 bg-white hover:bg-red-50 text-red-700'
     : 'border border-gray-200 bg-white hover:border-gray-900 text-gray-700 hover:text-gray-900';
   return (
-    <button onClick={onClick} disabled={busy} className={`${base} ${cls}`}>
+    <button onClick={onClick} disabled={busy || disabled} className={`${base} ${cls}`}>
       {busy ? <Loader2 size={14} className="animate-spin" /> : <Icon size={14} strokeWidth={2.5} />}
       {label}
     </button>

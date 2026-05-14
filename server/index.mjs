@@ -15,7 +15,7 @@
  */
 import express from 'express';
 import cookieParser from 'cookie-parser';
-import { execFile, exec } from 'node:child_process';
+import { execFile, exec, spawn } from 'node:child_process';
 import { readFile, writeFile, readdir, stat } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
@@ -39,6 +39,22 @@ const TOKEN = process.env.QCONTROL_TOKEN || '';
 const REVERSE_PROXY_DIR = path.join(HOST_OPT, 'reverse-proxy');
 const REVERSE_PROXY_HOST_PATH = `${HOST_OPT_REAL.replace(/\/+$/, '')}/reverse-proxy`;
 const WEB_DIST = path.join(__dirname, '..', 'web', 'dist');
+
+// Multi-VPS navigation. Each VPS runs its own qcontrol; the UI shows a
+// dropdown to jump between them. Configured via two env vars:
+//   QCONTROL_VPS_NAME     — human label for THIS VPS, e.g. "prod"
+//   QCONTROL_PEERS_JSON   — JSON: [{"name":"prod","url":"https://qcontrol.qbot.now"},
+//                                  {"name":"staging","url":"https://qcontrol.staging.qbot.now"}]
+//                           (include THIS vps too so the dropdown shows it as the active one)
+const VPS_NAME = process.env.QCONTROL_VPS_NAME || 'this vps';
+let VPS_PEERS = [];
+try {
+  VPS_PEERS = JSON.parse(process.env.QCONTROL_PEERS_JSON || '[]');
+  if (!Array.isArray(VPS_PEERS)) VPS_PEERS = [];
+} catch (e) {
+  console.warn('[qcontrol] QCONTROL_PEERS_JSON is malformed — VPS switcher will be empty:', e.message);
+  VPS_PEERS = [];
+}
 
 if (!TOKEN) {
   console.warn('[qcontrol] QCONTROL_TOKEN not set — the UI will refuse every request. Set it in .env before going live.');
@@ -89,6 +105,11 @@ app.post('/api/auth/logout', (_req, res) => {
 app.get('/api/auth/whoami', (req, res) => {
   const supplied = (req.cookies?.qcontrol_token || '').trim();
   res.json({ authed: !!TOKEN && supplied === TOKEN });
+});
+
+// Public — even pre-auth pages need this for the VPS switcher in the shell.
+app.get('/api/peers', (_req, res) => {
+  res.json({ self: VPS_NAME, peers: VPS_PEERS });
 });
 
 // ─── VPS health (CPU / mem / disk / processes / containers) ──────────────
@@ -419,409 +440,236 @@ app.get('/api/projects/:name/logs', authed, async (req, res) => {
 });
 
 // ─── project actions ─────────────────────────────────────────────────────
-/** Run a compose command inside a project's directory, with the vps overlay when present. */
-async function runCompose(project, command, opts = {}) {
-  const dir = path.join(HOST_OPT, project);
-  const overlay = path.join(dir, 'docker-compose.vps.yml');
-  const args = ['compose', '-f', 'docker-compose.yml'];
-  if (existsSync(overlay)) args.push('-f', 'docker-compose.vps.yml');
-  args.push(...command);
-  return execFileP('docker', args, { cwd: dir, timeout: opts.timeout ?? 15 * 60 * 1000, maxBuffer: 8 * 1024 * 1024 });
+//
+// Every action below streams its output back to the client in real time
+// (chunked text/plain). The browser reads the response body incrementally
+// and appends to a terminal pane, so the user sees what's happening as it
+// happens instead of waiting for a final 200 with a big log blob.
+
+/**
+ * Auto-detect the canonical compose invocation for a project by reading
+ * its deploy*.sh — every project on this VPS uses a different layout
+ * (qbotu wants docker-compose.production.yml; qrpos wants the plain
+ * docker-compose.yml; etc). Parses the COMPOSE_CMD=( ... ) array from
+ * the deploy script if present. Falls back to the conventional
+ * docker-compose.yml + docker-compose.vps.yml pair.
+ *
+ * Returns { composeFiles: string[], projectName: string | null }.
+ */
+async function detectComposeSetup(projectDir) {
+  let composeFiles = null;
+  let projectName = null;
+
+  // 1) Look for a deploy script and pull -f flags out of its COMPOSE_CMD.
+  for (const script of ['deploy-vps.sh', 'deploy.sh']) {
+    const p = path.join(projectDir, script);
+    if (!existsSync(p)) continue;
+    try {
+      const body = await readFile(p, 'utf8');
+      // Match COMPOSE_CMD=( ... ) including newlines.
+      const m = body.match(/COMPOSE_CMD=\(([^)]+)\)/s);
+      if (m) {
+        const files = [];
+        const tokens = m[1].split(/\s+/).filter(Boolean);
+        for (let i = 0; i < tokens.length; i++) {
+          if (tokens[i] === '-f' && tokens[i + 1]) {
+            files.push(tokens[i + 1].replace(/['"`]/g, ''));
+          }
+        }
+        if (files.length > 0) composeFiles = files;
+      }
+      // Look for an explicit COMPOSE_PROJECT_NAME export.
+      const pn = body.match(/COMPOSE_PROJECT_NAME[=\s]+["']?([A-Za-z0-9_-]+)["']?/);
+      if (pn) projectName = pn[1];
+    } catch { /* ignore */ }
+    if (composeFiles) break;
+  }
+
+  // 2) Look for COMPOSE_PROJECT_NAME in the project's .env (overrides script).
+  if (!projectName) {
+    try {
+      const env = await readFile(path.join(projectDir, '.env'), 'utf8');
+      const m = env.match(/^COMPOSE_PROJECT_NAME\s*=\s*(.+?)\s*$/m);
+      if (m) projectName = m[1];
+    } catch { /* no .env, fine */ }
+  }
+
+  // 3) Top-level `name:` in the first compose file overrides everything else.
+  if (!projectName && composeFiles) {
+    try {
+      const body = await readFile(path.join(projectDir, composeFiles[0]), 'utf8');
+      const m = body.match(/^name:\s*([A-Za-z0-9_-]+)\s*$/m);
+      if (m) projectName = m[1];
+    } catch { /* ignore */ }
+  }
+
+  // 4) Fall back to the conventional pair.
+  if (!composeFiles) {
+    composeFiles = ['docker-compose.yml'];
+    if (existsSync(path.join(projectDir, 'docker-compose.vps.yml'))) {
+      composeFiles.push('docker-compose.vps.yml');
+    }
+  }
+
+  return { composeFiles, projectName };
 }
+
+/** Detect whether a project's git remote uses SSH (and therefore needs a
+ *  deploy key) or HTTPS (which usually works for public repos without auth).
+ *  Returns { hasGit, remoteUrl, isSshRemote, isPrivateLikely }. */
+async function detectGitRemote(projectDir) {
+  if (!existsSync(path.join(projectDir, '.git'))) {
+    return { hasGit: false, remoteUrl: null, isSshRemote: false, isPrivateLikely: false };
+  }
+  try {
+    const r = await execFileP('git', ['-C', projectDir, 'remote', 'get-url', 'origin'], { timeout: 3000 });
+    const remoteUrl = r.stdout.trim();
+    const isSshRemote = /^(git@|ssh:\/\/)/.test(remoteUrl);
+    // We can't be SURE a repo is private without making an HTTP call, but
+    // SSH-style remotes (git@github.com:org/repo) are the convention for
+    // private repos. Public repos usually use https://github.com/...
+    return { hasGit: true, remoteUrl, isSshRemote, isPrivateLikely: isSshRemote };
+  } catch (e) {
+    return { hasGit: true, remoteUrl: null, isSshRemote: false, isPrivateLikely: false, error: e.message };
+  }
+}
+
+/** Spawn a child process and stream its stdout/stderr to `res` line-by-line.
+ *  Resolves with the exit code (0 = success). Never throws — non-zero exit
+ *  codes are emitted as a footer line so the client sees them in-stream. */
+function streamCmd(res, label, cmd, args, opts = {}) {
+  return new Promise((resolve) => {
+    const header = label ? `\n\x1b[1m==> ${label}\x1b[0m\n$ ${cmd} ${args.join(' ')}\n` : `$ ${cmd} ${args.join(' ')}\n`;
+    res.write(header);
+    const child = spawn(cmd, args, { cwd: opts.cwd, env: { ...process.env, ...(opts.env || {}) } });
+    child.stdout.on('data', (chunk) => res.write(chunk));
+    child.stderr.on('data', (chunk) => res.write(chunk));
+    child.on('error', (e) => {
+      res.write(`\n[qcontrol] failed to spawn ${cmd}: ${e.message}\n`);
+      resolve(127);
+    });
+    child.on('close', (code) => {
+      if (code !== 0) res.write(`\n[qcontrol] exit code: ${code}\n`);
+      resolve(code ?? 0);
+    });
+  });
+}
+
+/** Run a sequence of commands, stopping at the first non-zero exit. Writes
+ *  a single final marker line so the client knows the action is done. */
+async function runStreamed(res, steps) {
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('X-Accel-Buffering', 'no'); // disable buffering in nginx if present
+  res.flushHeaders?.();
+  let finalCode = 0;
+  for (const step of steps) {
+    const code = await streamCmd(res, step.label, step.cmd, step.args, step.opts);
+    if (code !== 0) {
+      finalCode = code;
+      res.write(`\n[qcontrol] aborting — "${step.label}" failed.\n`);
+      break;
+    }
+  }
+  res.write(finalCode === 0 ? '\n[qcontrol] ✓ done\n' : `\n[qcontrol] ✗ finished with errors (exit ${finalCode})\n`);
+  res.end();
+}
+
+/** Resolve a project name to its compose plan and directory. */
+async function resolveProjectAction(project) {
+  const dir = path.join(HOST_OPT, project);
+  if (!existsSync(dir)) throw Object.assign(new Error('no_such_project'), { status: 404 });
+  const { composeFiles, projectName } = await detectComposeSetup(dir);
+  const composeArgs = ['compose'];
+  for (const f of composeFiles) composeArgs.push('-f', f);
+  const env = projectName ? { COMPOSE_PROJECT_NAME: projectName } : {};
+  return { dir, composeFiles, projectName, composeArgs, env };
+}
+
+/** GET — peek what an action is going to do without executing.  Used by the
+ *  confirmation modal so the user sees the exact compose files + project
+ *  name before they type "confirm". Also exposes git remote info so the UI
+ *  can warn about private-repo pulls that may need an SSH key. */
+app.get('/api/projects/:name/plan', authed, async (req, res) => {
+  try {
+    const r = await resolveProjectAction(req.params.name);
+    const gitRemote = await detectGitRemote(r.dir);
+    res.json({
+      project: req.params.name,
+      dir: r.dir,
+      composeFiles: r.composeFiles,
+      projectName: r.projectName,
+      git: gitRemote,
+    });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
 
 app.post('/api/projects/:name/restart', authed, async (req, res) => {
   try {
-    const { stdout, stderr } = await runCompose(req.params.name, ['restart']);
-    res.json({ ok: true, log: stdout + stderr });
-  } catch (e) { res.status(500).json({ error: 'compose_error', message: e.stderr || e.message }); }
+    const r = await resolveProjectAction(req.params.name);
+    await runStreamed(res, [
+      { label: 'docker compose restart', cmd: 'docker', args: [...r.composeArgs, 'restart'], opts: { cwd: r.dir, env: r.env } },
+    ]);
+  } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
 });
 
 app.post('/api/projects/:name/up', authed, async (req, res) => {
   try {
-    const { stdout, stderr } = await runCompose(req.params.name, ['up', '-d', '--force-recreate']);
-    res.json({ ok: true, log: stdout + stderr });
-  } catch (e) { res.status(500).json({ error: 'compose_error', message: e.stderr || e.message }); }
+    const r = await resolveProjectAction(req.params.name);
+    await runStreamed(res, [
+      { label: 'docker compose up -d --force-recreate', cmd: 'docker', args: [...r.composeArgs, 'up', '-d', '--force-recreate'], opts: { cwd: r.dir, env: r.env } },
+    ]);
+  } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
 });
 
 app.post('/api/projects/:name/rebuild', authed, async (req, res) => {
   try {
-    const build = await runCompose(req.params.name, ['build', '--no-cache']);
-    const up = await runCompose(req.params.name, ['up', '-d', '--force-recreate']);
-    res.json({ ok: true, log: build.stdout + build.stderr + '\n' + up.stdout + up.stderr });
-  } catch (e) { res.status(500).json({ error: 'compose_error', message: e.stderr || e.message }); }
+    const r = await resolveProjectAction(req.params.name);
+    await runStreamed(res, [
+      { label: 'docker compose build --no-cache', cmd: 'docker', args: [...r.composeArgs, 'build', '--no-cache'], opts: { cwd: r.dir, env: r.env } },
+      { label: 'docker compose up -d --force-recreate', cmd: 'docker', args: [...r.composeArgs, 'up', '-d', '--force-recreate'], opts: { cwd: r.dir, env: r.env } },
+    ]);
+  } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
 });
 
 app.post('/api/projects/:name/pull-and-rebuild', authed, async (req, res) => {
-  const project = req.params.name;
-  const dir = path.join(HOST_OPT, project);
   try {
-    const pull = await execFileP('git', ['-C', dir, 'pull', '--ff-only'], { timeout: 60000 });
-    const build = await runCompose(project, ['build', '--no-cache']);
-    const up = await runCompose(project, ['up', '-d', '--force-recreate']);
-    res.json({ ok: true, log: pull.stdout + pull.stderr + '\n' + build.stdout + build.stderr + '\n' + up.stdout + up.stderr });
-  } catch (e) { res.status(500).json({ error: 'deploy_error', message: e.stderr || e.message }); }
+    const r = await resolveProjectAction(req.params.name);
+    const git = await detectGitRemote(r.dir);
+    const steps = [];
+    if (git.hasGit) {
+      // GIT_SSH_COMMAND uses the host SSH keys mounted at /root/.ssh.
+      // StrictHostKeyChecking=accept-new auto-trusts new hosts (github.com)
+      // the first time without blocking — for known hosts it still verifies.
+      const sshCommand = 'ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes';
+      steps.push({
+        label: 'git pull --ff-only',
+        cmd: 'git',
+        args: ['-C', r.dir, 'pull', '--ff-only'],
+        opts: { cwd: r.dir, env: { GIT_SSH_COMMAND: sshCommand } },
+      });
+    } else {
+      steps.push({ label: 'no git repo — skipping pull', cmd: 'true', args: [] });
+    }
+    steps.push(
+      { label: 'docker compose build --no-cache', cmd: 'docker', args: [...r.composeArgs, 'build', '--no-cache'], opts: { cwd: r.dir, env: r.env } },
+      { label: 'docker compose up -d --force-recreate', cmd: 'docker', args: [...r.composeArgs, 'up', '-d', '--force-recreate'], opts: { cwd: r.dir, env: r.env } },
+    );
+    await runStreamed(res, steps);
+  } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
 });
 
 app.post('/api/projects/:name/down', authed, async (req, res) => {
   try {
-    const { stdout, stderr } = await runCompose(req.params.name, ['down']);
-    res.json({ ok: true, log: stdout + stderr });
-  } catch (e) { res.status(500).json({ error: 'compose_error', message: e.stderr || e.message }); }
+    const r = await resolveProjectAction(req.params.name);
+    await runStreamed(res, [
+      { label: 'docker compose down', cmd: 'docker', args: [...r.composeArgs, 'down'], opts: { cwd: r.dir, env: r.env } },
+    ]);
+  } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
 });
 
-// ─── clone-to-staging ───────────────────────────────────────────────────
-
-/** Slug-safe identifier (a-z 0-9 dash). Used for derived dest name suffix. */
-function slugify(input) {
-  return String(input || '').toLowerCase().trim().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '');
-}
-
-/** Scan the reverse-proxy .env, the Caddyfile, every project's
- *  docker-compose.vps.yml, and the running docker container port
- *  publications — return the union of ports already in use so we don't
- *  double-allocate when picking a port for a new staging clone. */
-async function collectUsedPorts() {
-  const used = new Set();
-
-  try {
-    const envBody = await readFile(path.join(REVERSE_PROXY_DIR, '.env'), 'utf8');
-    for (const m of envBody.matchAll(/127\.0\.0\.1:(\d{2,5})/g)) used.add(Number(m[1]));
-  } catch { /* ignore */ }
-  try {
-    const cf = await readFile(path.join(REVERSE_PROXY_DIR, 'Caddyfile'), 'utf8');
-    for (const m of cf.matchAll(/127\.0\.0\.1:(\d{2,5})/g)) used.add(Number(m[1]));
-  } catch { /* ignore */ }
-
-  try {
-    const entries = await readdir(HOST_OPT, { withFileTypes: true });
-    for (const e of entries) {
-      if (!e.isDirectory()) continue;
-      const overlay = path.join(HOST_OPT, e.name, 'docker-compose.vps.yml');
-      if (!existsSync(overlay)) continue;
-      try {
-        const body = await readFile(overlay, 'utf8');
-        for (const m of body.matchAll(/127\.0\.0\.1:(\d{2,5})/g)) used.add(Number(m[1]));
-      } catch { /* ignore */ }
-    }
-  } catch { /* ignore */ }
-
-  try {
-    const { stdout } = await execFileP('docker', ['ps', '--format', '{{.Ports}}'], { timeout: 5000 });
-    for (const m of stdout.matchAll(/(?:127\.0\.0\.1:)?(\d{2,5})->/g)) used.add(Number(m[1]));
-  } catch { /* docker offline — fine */ }
-
-  return used;
-}
-
-/** Walk forward from start, return the first port not in `used`. */
-function nextFreePort(used, start = 8088) {
-  for (let p = start; p < 9000; p++) if (!used.has(p)) return p;
-  throw new Error('No free port in 8088-8999');
-}
-
-/** Convert a project name to the SLUG used as an env-var prefix in
- *  /opt/reverse-proxy/.env — upper-case, dashes → underscores. Used both
- *  when WRITING new entries and when DETECTING the source project's
- *  existing entries so we can suggest re-mapping them on a clone. */
-function projectEnvSlug(projectName) {
-  return slugify(projectName).toUpperCase().replace(/-/g, '_');
-}
-
-/** Parse /opt/reverse-proxy/.env and return every `<SLUG>_…_DOMAIN=value`
- *  line that belongs to `projectName`. Returns
- *  `[{ envKey, destKeySuffix, value }]` where destKeySuffix is the part
- *  AFTER the SLUG prefix (e.g. for QBOTU_API_DOMAIN we get 'API_DOMAIN',
- *  for the bare QBOTU_DOMAIN we get 'DOMAIN'). Lets the UI surface every
- *  domain the source already serves so the clone gets one new domain per
- *  source domain, all wired to the new upstream. */
-async function readSourceDomainEntries(projectName) {
-  const slug = projectEnvSlug(projectName);
-  const re = new RegExp(`^${slug}((?:_[A-Z0-9]+)*?_DOMAIN)\\s*=\\s*(.+?)\\s*$`);
-  const entries = [];
-  try {
-    const body = await readFile(path.join(REVERSE_PROXY_DIR, '.env'), 'utf8');
-    for (const line of body.split('\n')) {
-      const m = line.match(re);
-      if (!m) continue;
-      entries.push({
-        envKey: `${slug}${m[1]}`,
-        destKeySuffix: m[1].replace(/^_/, ''), // drop leading underscore
-        value: m[2],
-      });
-    }
-  } catch { /* file missing — return [] */ }
-  return entries;
-}
-
-app.get('/api/projects/:name/clone-info', authed, async (req, res) => {
-  const project = req.params.name;
-  const dir = path.join(HOST_OPT, project);
-  if (!existsSync(dir)) return res.status(404).json({ error: 'no_such_project' });
-
-  let gitRemote = null;
-  let branches = [];
-  try {
-    const r = await execFileP('git', ['-C', dir, 'remote', 'get-url', 'origin'], { timeout: 3000 });
-    gitRemote = r.stdout.trim();
-  } catch { /* not a git repo */ }
-  try {
-    const r = await execFileP('git', ['-C', dir, 'for-each-ref', '--format=%(refname:short)', 'refs/remotes/origin'], { timeout: 3000 });
-    branches = r.stdout.split('\n').map((s) => s.trim()).filter(Boolean)
-      .map((b) => b.replace(/^origin\//, '')).filter((b) => b !== 'HEAD');
-  } catch { /* ignore */ }
-
-  const used = await collectUsedPorts();
-  const suggestedPort = nextFreePort(used);
-  const sourceDomains = await readSourceDomainEntries(project);
-
-  res.json({
-    source: project,
-    gitRemote,
-    branches,
-    suggestedDest: `${project}-staging`,
-    suggestedPort,
-    usedPorts: Array.from(used).sort((a, b) => a - b),
-    sourceDomains,
-  });
-});
-
-app.post('/api/projects/clone', authed, async (req, res) => {
-  const {
-    source,
-    dest: rawDest,
-    method = 'git',           // 'git' or 'copy'
-    branch,                   // required when method=git
-    domain,                   // legacy single-domain field (kept for back-compat)
-    domainMappings: rawDomainMappings, // new — [{ destKeySuffix, sourceDomain, destDomain }]
-    port: rawPort,            // optional — auto-allocate when missing
-    reloadCaddy = true,
-  } = req.body || {};
-
-  // Normalize domain mappings — either an explicit array, OR derive a
-  // single-entry one from the legacy `domain` param.
-  let domainMappings = Array.isArray(rawDomainMappings)
-    ? rawDomainMappings
-        .map((m) => ({
-          destKeySuffix: String(m.destKeySuffix || 'DOMAIN').toUpperCase().replace(/[^A-Z0-9_]/g, '_'),
-          sourceDomain: (m.sourceDomain || '').trim(),
-          destDomain: (m.destDomain || '').trim(),
-        }))
-        .filter((m) => m.destDomain) // skip blanks
-    : [];
-  if (domainMappings.length === 0 && domain) {
-    domainMappings = [{ destKeySuffix: 'DOMAIN', sourceDomain: '', destDomain: String(domain).trim() }];
-  }
-
-  const log = [];
-  const push = (line) => log.push(line);
-
-  if (!source || typeof source !== 'string') return res.status(400).json({ error: 'source_required' });
-  const dest = slugify(rawDest || `${source}-staging`);
-  if (!dest) return res.status(400).json({ error: 'dest_required' });
-
-  const srcDir = path.join(HOST_OPT, source);
-  const destDir = path.join(HOST_OPT, dest);
-  if (!existsSync(srcDir)) return res.status(404).json({ error: 'no_such_source' });
-  if (existsSync(destDir)) return res.status(409).json({ error: 'dest_exists', message: `${destDir} already exists` });
-
-  let port = Number(rawPort);
-  if (!Number.isFinite(port) || port < 1024 || port > 65535) {
-    const used = await collectUsedPorts();
-    port = nextFreePort(used);
-    push(`==> Auto-allocated port: ${port}`);
-  }
-
-  // 1) Copy or clone the project tree.
-  try {
-    if (method === 'git') {
-      const remoteResult = await execFileP('git', ['-C', srcDir, 'remote', 'get-url', 'origin'], { timeout: 3000 });
-      const remote = remoteResult.stdout.trim();
-      if (!remote) throw new Error('source has no git remote — switch to copy mode');
-      const targetBranch = branch || 'main';
-      push(`==> git clone ${remote} -b ${targetBranch} → ${destDir}`);
-      const r = await execFileP('git', ['clone', '--branch', targetBranch, '--single-branch', remote, destDir], { timeout: 5 * 60 * 1000 });
-      push(r.stdout + r.stderr);
-    } else if (method === 'copy') {
-      push(`==> cp -r ${srcDir} → ${destDir}`);
-      try {
-        // Exclude .env: the source's env points at the source's port + DB, never
-        // safe to carry over verbatim. The user starts the staging instance with
-        // .env IS carried over now — qcontrol will rewrite its ports +
-        // domain values below, which is the whole reason we're doing this.
-        const r = await execFileP('rsync', ['-a', '--exclude', '.git', '--exclude', 'node_modules', '--exclude', 'vendor', '--exclude', 'data', `${srcDir}/`, `${destDir}/`], { timeout: 10 * 60 * 1000 });
-        push(r.stdout + r.stderr || '(rsync ok)');
-      } catch {
-        const r = await execFileP('cp', ['-r', srcDir, destDir], { timeout: 10 * 60 * 1000 });
-        push(r.stdout + r.stderr || '(cp ok)');
-      }
-    } else {
-      return res.status(400).json({ error: 'bad_method', message: 'method must be git or copy' });
-    }
-  } catch (e) {
-    push('✗ ' + (e.stderr || e.message));
-    return res.status(500).json({ ok: false, log: log.join('\n') });
-  }
-
-  // 1.5) Rewrite the cloned project's docker-compose.vps.yml so its
-  //      published ports don't collide with the source. The clone inherits
-  //      the SOURCE's `127.0.0.1:NNNN:M` bindings verbatim — if the source
-  //      is already running on those ports, the new staging stack either
-  //      fails to start or reuses them, and the reverse-proxy upstream we
-  //      just allocated points at a port that nothing is listening on.
-  //
-  // Strategy:
-  //   • parse every `127.0.0.1:<port>:` in the cloned overlay
-  //   • allocate a consecutive new port for each unique source port,
-  //     starting from `port` (the auto-allocated upstream we already had)
-  //   • rewrite the file in-place
-  //   • the FIRST new port becomes the public-facing upstream the
-  //     reverse-proxy block points at (multi-port projects with path-split
-  //     routing still need a manual Caddy edit, but the single-port case —
-  //     which is most projects — is fully automatic).
-  const overlayPath = path.join(destDir, 'docker-compose.vps.yml');
-  let portMap = {};
-  if (existsSync(overlayPath)) {
-    try {
-      let body = await readFile(overlayPath, 'utf8');
-      const matches = [...body.matchAll(/127\.0\.0\.1:(\d{2,5}):/g)];
-      const uniqueSourcePorts = [...new Set(matches.map((m) => Number(m[1])))];
-      if (uniqueSourcePorts.length > 0) {
-        const used = await collectUsedPorts();
-        // The user/auto-allocated `port` is the first new port we want.
-        // Skip past any already-used ports as we walk forward.
-        let cursor = port;
-        for (const srcPort of uniqueSourcePorts) {
-          while (used.has(cursor)) cursor++;
-          portMap[srcPort] = cursor;
-          used.add(cursor);
-          cursor++;
-        }
-        for (const [srcPort, newPort] of Object.entries(portMap)) {
-          const re = new RegExp(`127\\.0\\.0\\.1:${srcPort}:`, 'g');
-          body = body.replace(re, `127.0.0.1:${newPort}:`);
-        }
-        await writeFile(overlayPath, body, 'utf8');
-        push(`==> rewrote ports in docker-compose.vps.yml: ${JSON.stringify(portMap)}`);
-        // Make the FIRST remapped port the reverse-proxy upstream so the
-        // domain we wire below actually reaches a listening socket.
-        port = portMap[uniqueSourcePorts[0]];
-      } else {
-        push('==> docker-compose.vps.yml has no 127.0.0.1 port bindings — nothing to rewrite');
-      }
-    } catch (e) {
-      push('✗ port rewrite failed (cloned tree still on disk): ' + e.message);
-    }
-  } else {
-    push('==> no docker-compose.vps.yml in source — skipping port rewrite (start the clone with the source\'s ports!)');
-  }
-
-  // 1.75) Rewrite the cloned project's own .env (if one exists). The
-  //       source's .env carries production hostnames and HOST_PORT values
-  //       that point at the source's stack — leaving them unchanged means
-  //       the staging clone serves the wrong domain bindings (so internal
-  //       nginx routing misses) and binds the wrong host ports (collides
-  //       with the source). We rewrite:
-  //         • every `*_HOST_PORT=N`  →  portMap[N]  (if remapped)
-  //         • every occurrence of sourceDomain → destDomain across the file
-  //           (catches APP_DOMAIN, API_DOMAIN, FRONTEND_URL, API_URL,
-  //            VITE_API_BASE_URL, MINIO_URL, etc. without us having to
-  //            enumerate every var name a given stack might use)
-  const destEnvPath = path.join(destDir, '.env');
-  if (existsSync(destEnvPath)) {
-    try {
-      let envBody = await readFile(destEnvPath, 'utf8');
-      const rewrites = [];
-
-      // Port rewrites — only touch lines that look like a HOST_PORT.
-      if (Object.keys(portMap).length > 0) {
-        envBody = envBody.replace(/^([A-Z_]+_HOST_PORT)\s*=\s*(\d{2,5})\s*$/gm, (line, key, val) => {
-          const n = Number(val);
-          if (portMap[n]) { rewrites.push(`${key}: ${n} → ${portMap[n]}`); return `${key}=${portMap[n]}`; }
-          return line;
-        });
-      }
-
-      // Domain rewrites — pure string replacement, applied longest-first
-      // so e.g. hub-api.qbot.jp gets swapped before hub.qbot.jp (otherwise
-      // the shorter prefix would gobble the longer one).
-      const mappingsByLength = [...domainMappings]
-        .filter((m) => m.sourceDomain)
-        .sort((a, b) => b.sourceDomain.length - a.sourceDomain.length);
-      for (const m of mappingsByLength) {
-        const re = new RegExp(m.sourceDomain.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g');
-        const before = envBody;
-        envBody = envBody.replace(re, m.destDomain);
-        if (before !== envBody) rewrites.push(`domain: ${m.sourceDomain} → ${m.destDomain}`);
-      }
-
-      if (rewrites.length > 0) {
-        await writeFile(destEnvPath, envBody, 'utf8');
-        push(`==> rewrote /opt/${dest}/.env (${rewrites.length} change${rewrites.length === 1 ? '' : 's'}):`);
-        for (const r of rewrites) push(`     • ${r}`);
-      } else {
-        push(`==> /opt/${dest}/.env carried over verbatim (no matching port/domain rewrites)`);
-      }
-    } catch (e) {
-      push('✗ .env rewrite failed (cloned tree still on disk): ' + e.message);
-    }
-  } else {
-    push(`==> no .env in cloned tree at /opt/${dest}/.env — skipping env rewrite (you may need to create one before bringing the stack up)`);
-  }
-
-  // 2) Wire reverse-proxy: one Caddy block + env entry per mapped domain,
-  //    all pointing at a single shared `${SLUG}_UPSTREAM`. This matches the
-  //    qbotu pattern of one proxy fronting multiple Host headers.
-  const proxyDetails = [];
-  if (domainMappings.length > 0) {
-    const slug = projectEnvSlug(dest);
-    const envPath = path.join(REVERSE_PROXY_DIR, '.env');
-    const caddyPath = path.join(REVERSE_PROXY_DIR, 'Caddyfile');
-
-    // Build env block: one UPSTREAM line + one DOMAIN line per mapping.
-    const envLines = [`${slug}_UPSTREAM=127.0.0.1:${port}`];
-    const caddyBlocks = [];
-    for (const m of domainMappings) {
-      const envKey = `${slug}_${m.destKeySuffix}`;
-      envLines.push(`${envKey}=${m.destDomain}`);
-      caddyBlocks.push(`{$${envKey}} {\n  reverse_proxy {$${slug}_UPSTREAM}\n}\n`);
-      proxyDetails.push({ domain: m.destDomain, envKey, sourceDomain: m.sourceDomain || null });
-    }
-
-    try {
-      const existingEnv = (await readFile(envPath, 'utf8').catch(() => '')) || '';
-      const newEnv = existingEnv.replace(/\s*$/, '') + `\n\n# ${dest}\n${envLines.join('\n')}\n`;
-      await writeFile(envPath, newEnv, 'utf8');
-      push(`==> appended ${envLines.length} line(s) to /opt/reverse-proxy/.env`);
-
-      const existingCaddy = await readFile(caddyPath, 'utf8');
-      await writeFile(caddyPath, existingCaddy.replace(/\s*$/, '') + '\n\n' + caddyBlocks.join('\n'), 'utf8');
-      push(`==> appended ${caddyBlocks.length} block(s) to /opt/reverse-proxy/Caddyfile`);
-
-      if (reloadCaddy) {
-        // Pre-validates in a throw-away container BEFORE recreating, so a
-        // bad Caddyfile or empty env var can't take the running reverse-
-        // proxy down (which would dark every domain on this VPS).
-        const rec = await safeRecreateCaddy();
-        push(rec.log);
-        if (!rec.ok) {
-          push('   (.env and Caddyfile were written but Caddy was left on the OLD config — your traffic is still live)');
-        }
-      }
-    } catch (e) {
-      push('✗ reverse-proxy wire-up failed: ' + e.message);
-    }
-  }
-
-  res.json({
-    ok: true,
-    dest,
-    destDir,
-    port,
-    portMap,
-    proxy: proxyDetails,
-    log: log.join('\n'),
-  });
-});
 
 // ─── reverse-proxy editor ────────────────────────────────────────────────
 app.get('/api/revproxy/env', authed, async (_req, res) => {
@@ -960,10 +808,15 @@ app.post('/api/revproxy/recreate', authed, async (_req, res) => {
 
 // ─── destroy / remove project ───────────────────────────────────────────
 
+/** Slug-safe identifier (a-z 0-9 dash). */
+function slugify(input) {
+  return String(input || '').toLowerCase().trim().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
 /**
  * Strip a project's lines from the reverse-proxy .env and its block from
  * the Caddyfile. Returns true if anything was removed. We match by the
- * SLUG prefix that the clone code uses (PROJECT_NAME_UPPER_WITH_UNDERSCORES).
+ * SLUG prefix (PROJECT_NAME_UPPER_WITH_UNDERSCORES).
  */
 async function removeReverseProxyEntries(projectName) {
   const slug = slugify(projectName).toUpperCase().replace(/-/g, '_');

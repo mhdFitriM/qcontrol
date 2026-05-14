@@ -38,6 +38,161 @@ ssh -i ~/.ssh/qbot_vps root@<vps-host>`,
 
 const PROJECT_DOCS: ProjectDoc[] = [
   {
+    slug: 'fresh-vps-setup',
+    name: 'Fresh VPS setup',
+    blurb: 'Stand up a brand-new VPS to mirror prod — Docker Engine + firewall + SSH deploy keys + shared reverse-proxy + qcontrol. Used when spinning up staging or a replacement host.',
+    domains: ['(any new VPS)'],
+    manual: [
+      {
+        title: 'System update + base tools',
+        body: 'Run as root on the freshly-provisioned VPS. Installs the utilities every later step assumes.',
+        cmd: `apt-get update && apt-get upgrade -y
+apt-get install -y curl git vim htop ufw ca-certificates gnupg lsb-release`,
+      },
+      {
+        title: 'Install Docker Engine (official repo)',
+        body: 'Installs docker-ce + the compose v2 plugin. Use `docker compose` (with a space) — there is no standalone docker-compose binary.',
+        cmd: `install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+chmod a+r /etc/apt/keyrings/docker.asc
+
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+apt-get update
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+docker --version
+docker compose version`,
+        note: 'Verify both version commands return something — that confirms the engine + compose plugin are both healthy.',
+      },
+      {
+        title: 'Firewall',
+        body: 'Only inbound 22 (SSH) + 80 + 443 are needed — every app on this VPS sits behind the shared reverse-proxy on 80/443.',
+        cmd: `ufw default deny incoming
+ufw default allow outgoing
+ufw allow OpenSSH
+ufw allow 80
+ufw allow 443
+ufw --force enable
+ufw status`,
+      },
+      {
+        title: 'SSH deploy key for private GitHub repos',
+        body: 'qcontrol\'s Pull + rebuild uses this key when running git pull against private repos. Generate, then add the public half as a Deploy Key on each private repo (Settings → Deploy keys → Add).',
+        cmd: `ssh-keygen -t ed25519 -C "staging-vps-deploy" -f ~/.ssh/id_ed25519 -N ""
+cat ~/.ssh/id_ed25519.pub`,
+        note: 'Read-only Deploy keys are sufficient for git pull. For an org-wide key, attach to a "deploy bot" user instead.',
+      },
+      {
+        title: 'Bootstrap /opt/reverse-proxy',
+        body: 'The shared Caddy that fronts every app on this VPS. Easiest path: scp the entire /opt/reverse-proxy folder from prod, then edit .env to only keep entries for projects that will run on this VPS.',
+        cmd: `mkdir -p /opt/reverse-proxy
+cd /opt/reverse-proxy
+
+# Option A — copy from prod (run from your laptop):
+#   scp -r root@<prod-host>:/opt/reverse-proxy ./
+
+# Option B — start fresh, minimal files:
+cat > .env <<'EOF'
+ACME_EMAIL=you@example.com
+EOF
+
+cat > Caddyfile <<'EOF'
+{
+    email {$ACME_EMAIL}
+}
+
+(common_headers) {
+    encode zstd gzip
+    header { -Server }
+}
+EOF
+
+# Drop docker-compose.yml from prod or write a minimal one referencing
+# caddy:2 with ports 80/443, /etc/caddy/Caddyfile bind-mounted, and
+# --env-file ./.env.
+
+docker compose up -d`,
+      },
+      {
+        title: 'Install qcontrol',
+        body: 'Clones the repo, generates a fresh token, sets the VPS name + peers JSON. The peers JSON is what makes the sidebar VPS-switcher appear once both VPSes are configured.',
+        cmd: `cd /opt
+git clone git@github.com:<your-org>/qcontrol.git
+cd qcontrol
+
+# Generate a strong token
+TOKEN=$(openssl rand -hex 32)
+
+cat > .env <<EOF
+QCONTROL_TOKEN=$TOKEN
+QCONTROL_VPS_NAME=staging
+QCONTROL_PEERS_JSON=[{"name":"prod","url":"https://qcontrol.qbot.now"},{"name":"staging","url":"https://qcontrol.staging.qbot.now"}]
+EOF
+
+docker compose -f docker-compose.yml -f docker-compose.vps.yml up -d
+
+# Save $TOKEN somewhere safe — you'll paste it into the login page.
+echo "QCONTROL_TOKEN=$TOKEN"`,
+        note: 'Replace QCONTROL_VPS_NAME with this VPS\'s role label (prod / staging / dev / etc.). Keep QCONTROL_PEERS_JSON identical on every peer so the dropdown is consistent.',
+      },
+      {
+        title: 'Wire qcontrol into the reverse-proxy',
+        body: 'qcontrol listens on 127.0.0.1:8089 inside the container. The reverse-proxy publishes it on the public domain over HTTPS.',
+        cmd: `# /opt/reverse-proxy/.env — append:
+echo "" >> /opt/reverse-proxy/.env
+echo "QCONTROL_DOMAIN=qcontrol.staging.qbot.now" >> /opt/reverse-proxy/.env
+echo "QCONTROL_UPSTREAM=127.0.0.1:8089" >> /opt/reverse-proxy/.env
+
+# /opt/reverse-proxy/Caddyfile — append:
+cat >> /opt/reverse-proxy/Caddyfile <<'EOF'
+
+{$QCONTROL_DOMAIN} {
+  reverse_proxy {$QCONTROL_UPSTREAM}
+}
+EOF
+
+cd /opt/reverse-proxy
+docker compose up -d --force-recreate caddy`,
+      },
+      {
+        title: 'DNS A record',
+        body: 'In cPanel / Cloudflare / wherever the zone lives, create an A record pointing qcontrol.staging.qbot.now to this VPS\'s IPv4 address. Wait 1–2 minutes for propagation, then visit https://qcontrol.staging.qbot.now and paste the token from step 6.',
+      },
+      {
+        title: 'Update the prod VPS to know about staging',
+        body: 'So the sidebar VPS-switcher on prod shows the new staging entry. Run on the PROD VPS, not on staging.',
+        cmd: `# Edit /opt/qcontrol/.env on the prod VPS
+vi /opt/qcontrol/.env
+# Make sure QCONTROL_PEERS_JSON includes BOTH prod and staging URLs
+
+cd /opt/qcontrol
+docker compose -f docker-compose.yml -f docker-compose.vps.yml up -d --force-recreate`,
+      },
+      {
+        title: 'Per-project setup',
+        body: 'For each app you want to run on this VPS: clone its repo to /opt/<project>, drop its .env in place, then use qcontrol\'s Pull + rebuild button to bring it up. Add reverse-proxy entries for its domains the same way we did for qcontrol in step 7.',
+        cmd: `cd /opt
+git clone git@github.com:<org>/<project>.git
+cd /opt/<project>
+
+# Drop in the project's .env (scp from prod or recreate from .env.example).
+# Then in qcontrol: open the project, click Pull + rebuild, type "confirm".`,
+        note: 'CI/CD auto-deploys to this VPS need GitHub Actions secrets per repo: STAGING_VPS_HOST, STAGING_VPS_USER, STAGING_VPS_SSH_KEY. Skip this step if you only want manual deploys via qcontrol.',
+      },
+    ],
+    viaQcontrol: [
+      {
+        title: 'This guide IS the qcontrol install',
+        body: 'There\'s no "via qcontrol" shortcut for the initial setup — qcontrol is what you\'re installing in step 6. Once it\'s up, every subsequent project deploy can be done with the Pull + rebuild button (qcontrol auto-detects each project\'s compose layout + project name + private-repo SSH needs).',
+      },
+      {
+        title: 'After qcontrol is up',
+        body: 'Future project additions are simpler: clone the repo to /opt/<project>, open it in qcontrol, click Pull + rebuild → type "confirm". qcontrol streams the build + up logs live and reports the status badge as containers come up.',
+      },
+    ],
+  },
+  {
     slug: 'qrpos',
     name: 'qrpos',
     blurb: 'Merchant POS — Laravel API + Vite SPA, served at qr.qbot.now via the shared reverse-proxy.',

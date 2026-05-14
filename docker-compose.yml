@@ -10,6 +10,13 @@ services:
       # `docker run -v` we shell out to needs the host's view (/opt).
       HOST_OPT_REAL: /opt
       PORT: 8089
+      # VPS switcher — each VPS labels itself + lists every peer. The UI
+      # surfaces these in the sidebar dropdown so the operator can jump
+      # between prod and staging in one click. Set both in /opt/qcontrol/.env:
+      #   QCONTROL_VPS_NAME=prod
+      #   QCONTROL_PEERS_JSON=[{"name":"prod","url":"https://qcontrol.qbot.now"},{"name":"staging","url":"https://qcontrol.staging.qbot.now"}]
+      QCONTROL_VPS_NAME: ${QCONTROL_VPS_NAME:-this vps}
+      QCONTROL_PEERS_JSON: ${QCONTROL_PEERS_JSON:-[]}
     volumes:
       # Docker socket — qcontrol shells out to the host's docker CLI through this.
       - /var/run/docker.sock:/var/run/docker.sock
@@ -20,5 +27,10 @@ services:
       # loadavg, uptime, and per-process CPU/mem from the actual host
       # rather than the container's namespaced view.
       - /proc:/host/proc:ro
+      # Host SSH keys, read-only — so `git pull` against private SSH
+      # remotes (git@github.com:org/repo.git) can use the same deploy key
+      # the rest of the VPS already trusts. No need to manage a separate
+      # key for qcontrol. Adjust path if running as a non-root user.
+      - /root/.ssh:/root/.ssh:ro
     ports:
       - "8089:8089"

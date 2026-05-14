@@ -17,6 +17,7 @@ interface Step {
   body?: string;     // optional prose, rendered above the command block
   cmd?: string;      // multi-line bash; rendered in a copyable terminal block
   note?: string;     // optional follow-up note rendered below
+  images?: { src: string; alt: string; caption?: string }[]; // visual aids — rendered below cmd
 }
 
 interface ProjectDoc {
@@ -29,11 +30,71 @@ interface ProjectDoc {
 }
 
 const COMMON_MANUAL_BOOTSTRAP: Step = {
-  title: 'SSH into the VPS',
-  body: 'All deployment commands run on the VPS host. From your laptop:',
-  cmd: `ssh root@<vps-host>
-# or with the key you've registered:
-ssh -i ~/.ssh/qbot_vps root@<vps-host>`,
+  title: 'Connect to the VPS with PuTTY',
+  body: 'All commands below run as root on the VPS host. We use PuTTY on Windows with a .ppk private key (kept in C:\\Users\\<you>\\Documents\\qbot.ppk). The matching public half is already in /root/.ssh/authorized_keys on every Qbot VPS.',
+  cmd: `# 1. Open PuTTY (Start → PuTTY → PuTTY)
+#
+# 2. Session pane:
+#       Host Name (or IP address): <vps-host or IP>
+#       Port: 22
+#       Connection type: SSH
+#
+# 3. Connection → SSH → Auth → Credentials:
+#       "Private key file for authentication": C:\\Users\\<you>\\Documents\\qbot.ppk
+#
+# 4. Connection → Data:
+#       Auto-login username: root
+#
+# 5. Session pane again → Saved Sessions: type "qbot-prod" (or "qbot-staging") → Save
+#       Now double-clicking the saved entry logs you straight in.
+#
+# 6. Click "Open" — PuTTY connects, .ppk unlocks the session, you land at:
+#       root@ubuntu-...:~#`,
+  note: 'If you don\'t have qbot.ppk yet, ask another admin to copy it to you (or generate a new keypair with PuTTYgen and have your public key added to /root/.ssh/authorized_keys on the VPS). Never share the .ppk over chat — it\'s the unencrypted private key.',
+  images: [
+    {
+      src: '/docs/putty/01-session.png',
+      alt: 'PuTTY Session pane — Host Name, Port 22, SSH selected',
+      caption: '1. Session pane — Host Name (or IP) + Port 22 + SSH selected. Don\'t click Open yet.',
+    },
+    {
+      src: '/docs/putty/02-ssh-auth-credentials.png',
+      alt: 'PuTTY Connection → SSH → Auth → Credentials with qbot.ppk loaded',
+      caption: '2. Connection → SSH → Auth → Credentials. Click "Browse…" next to "Private key file for authentication" and select qbot.ppk.',
+    },
+    {
+      src: '/docs/putty/03-connection-data.png',
+      alt: 'PuTTY Connection → Data with Auto-login username = root',
+      caption: '3. Connection → Data → Auto-login username = root. Skips the login prompt every time.',
+    },
+    {
+      src: '/docs/putty/04-saved-sessions.png',
+      alt: 'PuTTY Session pane — Saved Sessions list with qbot-prod/qbot-staging entries',
+      caption: '4. Back to Session pane. Type "qbot-prod" (or "qbot-staging") in Saved Sessions → Save. Double-clicking the entry next time logs you straight in.',
+    },
+  ],
+};
+
+const COMMON_FILE_TRANSFER_NOTE: Step = {
+  title: 'Copying files between laptop and VPS (PuTTY tooling)',
+  body: 'When a step says "scp from prod" or "copy /opt/<x> to the new VPS", use one of the PuTTY-ecosystem tools — they understand the same .ppk file PuTTY uses, no OpenSSH required.',
+  cmd: `# Option A — WinSCP (GUI, drag-and-drop, recommended)
+#   Download: https://winscp.net  (free)
+#   "Login" dialog: SFTP, hostname, user=root, "Advanced → SSH → Authentication"
+#   → load qbot.ppk as the private key. Drag files between panes.
+#
+# Option B — pscp (PuTTY's command-line scp, ships with PuTTY)
+#   Open a regular cmd.exe / PowerShell window on your laptop:
+#
+#       pscp -i C:\\Users\\<you>\\Documents\\qbot.ppk -r ^
+#            root@<source-vps>:/opt/reverse-proxy ^
+#            C:\\Users\\<you>\\Downloads\\reverse-proxy-backup
+#
+#       pscp -i C:\\Users\\<you>\\Documents\\qbot.ppk -r ^
+#            C:\\Users\\<you>\\Downloads\\reverse-proxy-backup ^
+#            root@<new-vps>:/opt/reverse-proxy
+#
+# Option C — sftp through WinSCP CLI / pscp; same idea.`,
 };
 
 const PROJECT_DOCS: ProjectDoc[] = [
@@ -83,14 +144,21 @@ ufw status`,
 cat ~/.ssh/id_ed25519.pub`,
         note: 'Read-only Deploy keys are sufficient for git pull. For an org-wide key, attach to a "deploy bot" user instead.',
       },
+      COMMON_FILE_TRANSFER_NOTE,
       {
         title: 'Bootstrap /opt/reverse-proxy',
-        body: 'The shared Caddy that fronts every app on this VPS. Easiest path: scp the entire /opt/reverse-proxy folder from prod, then edit .env to only keep entries for projects that will run on this VPS.',
+        body: 'The shared Caddy that fronts every app on this VPS. Easiest path: copy /opt/reverse-proxy from prod with WinSCP or pscp (see previous step), drop it at /opt/reverse-proxy on the new VPS, then edit .env to only keep entries for projects that will run on this VPS.',
         cmd: `mkdir -p /opt/reverse-proxy
 cd /opt/reverse-proxy
 
-# Option A — copy from prod (run from your laptop):
-#   scp -r root@<prod-host>:/opt/reverse-proxy ./
+# Option A — copy from prod (run on your laptop, NOT on the VPS):
+#   pscp -i C:\\Users\\<you>\\Documents\\qbot.ppk -r ^
+#        root@<prod-host>:/opt/reverse-proxy/ ^
+#        C:\\temp\\reverse-proxy-from-prod
+#   # then push it to the new VPS:
+#   pscp -i C:\\Users\\<you>\\Documents\\qbot.ppk -r ^
+#        C:\\temp\\reverse-proxy-from-prod\\* ^
+#        root@<new-vps>:/opt/reverse-proxy/
 
 # Option B — start fresh, minimal files:
 cat > .env <<'EOF'
@@ -179,7 +247,7 @@ docker compose -f docker-compose.yml -f docker-compose.vps.yml up -d --force-rec
 git clone git@github.com:<org>/<project>.git
 cd /opt/<project>
 
-# Drop in the project's .env (scp from prod or recreate from .env.example).
+# Drop in the project's .env (WinSCP / pscp from prod, or recreate from .env.example).
 # Then in qcontrol: open the project, click Pull + rebuild, type "confirm".`,
         note: 'CI/CD auto-deploys to this VPS need GitHub Actions secrets per repo: STAGING_VPS_HOST, STAGING_VPS_USER, STAGING_VPS_SSH_KEY. Skip this step if you only want manual deploys via qcontrol.',
       },
@@ -246,37 +314,65 @@ docker compose -f docker-compose.yml -f docker-compose.vps.yml logs --tail 100 -
   {
     slug: 'qbotu',
     name: 'project_qbotu_a3 (qbotu)',
-    blurb: 'Hub frontend + Laravel API. Served at hub.qbot.jp and hub-api.qbot.jp via the shared reverse-proxy.',
+    blurb: 'Hub frontend + Laravel API. Served at hub.qbot.jp + hub-api.qbot.jp via the shared reverse-proxy. Canonical deploy is `./deploy-vps.sh` — wraps the right compose files (docker-compose.production.yml + docker-compose.vps.yml), pre-deploy backup, incremental image rebuilds, and state tracking. NEVER run raw `docker compose` against this project.',
     domains: ['hub.qbot.jp', 'hub-api.qbot.jp', 'minio.qbotu.example.com'],
     manual: [
       COMMON_MANUAL_BOOTSTRAP,
       {
-        title: 'Pull the latest',
+        title: 'Standard deploy (pull latest + smart rebuild)',
+        body: 'This is the everyday command. deploy-vps.sh reads .deploy-vps-state, computes a git diff against the previous deploy, and only rebuilds the images that need rebuilding. Safe to run as often as you want.',
         cmd: `cd /opt/project_qbotu_a3
 git fetch --all --prune
-git reset --hard origin/main`,
+git reset --hard origin/main
+./deploy-vps.sh`,
+        note: 'The script automatically takes a pre-deploy backup unless one ran in the last 4 hours. To force a fresh backup: `./deploy-vps.sh --fresh-backup`.',
       },
       {
-        title: 'Rebuild + bring up',
+        title: 'Full rebuild — after Dockerfile or dependency changes',
+        body: 'Use this when composer.json / package.json / a Dockerfile / docker-compose.production.yml changed, OR when `.deploy-vps-state` got out of sync (e.g. after manual container surgery).',
         cmd: `cd /opt/project_qbotu_a3
-docker compose -f docker-compose.yml -f docker-compose.vps.yml build --no-cache
-docker compose -f docker-compose.yml -f docker-compose.vps.yml up -d --force-recreate --remove-orphans
-docker image prune -f`,
+./deploy-vps.sh --full-build`,
+        note: 'If --full-build still says "Images to build: none", remove the state file: `rm data/backups/.deploy-vps-state && ./deploy-vps.sh --full-build`. The state file is what tells the script "this matches the last successful deploy, nothing to do".',
+      },
+      {
+        title: 'Dry run — preview the deploy plan without touching Docker',
+        body: 'Prints exactly which services would be rebuilt + restarted, then exits. Use before any risky deploy.',
+        cmd: `cd /opt/project_qbotu_a3
+./deploy-vps.sh --dry-run`,
+      },
+      {
+        title: 'Hotfix mode — skip the pre-deploy backup',
+        body: 'Only safe when the change is rollback-friendly AND you already have a recent backup. Pre-deploy backups can take 1–2 minutes; this skips them.',
+        cmd: `cd /opt/project_qbotu_a3
+./deploy-vps.sh --skip-backup`,
       },
       {
         title: 'Tail logs',
         cmd: `cd /opt/project_qbotu_a3
-docker compose -f docker-compose.yml -f docker-compose.vps.yml logs --tail 200 -f`,
+# Same -f files deploy-vps.sh uses:
+docker compose -f docker-compose.production.yml -f docker-compose.vps.yml logs --tail 200 -f
+
+# Or use enter-backend.sh / enter-frontend.sh helpers for an interactive shell:
+./enter-backend.sh`,
+        note: 'Important — bare `docker compose -f docker-compose.yml ...` is the DEV stack and runs Vite\'s dev server. Always use the production file: `-f docker-compose.production.yml -f docker-compose.vps.yml`.',
+      },
+      {
+        title: 'Where the canonical docs live',
+        body: 'Full DevOps & Maintenance guide is committed to the repo at `docs/QBotu_DevOps_Maintenance_Guide.docx` (generated from `docs/generate_devops_doc.py`). Open it on your laptop for the long-form treatment of every flag, every backup mode, every recovery procedure.',
       },
     ],
     viaQcontrol: [
       {
-        title: 'Pull + rebuild',
-        body: 'Projects → project_qbotu_a3 → Pull + rebuild. Status badge confirms when every container is back.',
+        title: 'Pull + rebuild button',
+        body: 'Projects → project_qbotu_a3 → Pull + rebuild. qcontrol auto-detects the deploy-vps.sh COMPOSE_CMD (docker-compose.production.yml + docker-compose.vps.yml) AND the COMPOSE_PROJECT_NAME (project_qbotu_a3_prod), so the action targets the real prod stack — no risk of accidentally spawning an orphan stack under the directory name.',
       },
       {
-        title: 'Clone to a staging instance',
-        body: 'Use the Clone button on the Projects row. qcontrol auto-allocates ports, rewrites docker-compose.vps.yml + .env (HOST_PORT and every embedded domain), and wires the reverse-proxy with one Caddy block per source domain.',
+        title: 'For full rebuild — use the terminal (deploy-vps.sh --full-build)',
+        body: 'qcontrol\'s Pull + rebuild button runs `docker compose build --no-cache` + `up -d --force-recreate`. That covers most deploys, but it does NOT run scripts/build-frontend-assets.sh (which is what bakes VITE_* vars into the static bundle). For changes to VITE_API_BASE_URL or any other build-time var, SSH in and run `./deploy-vps.sh --full-build` so the frontend asset build kicks off.',
+      },
+      {
+        title: 'Status badge tells you when it\'s back',
+        body: 'After Pull + rebuild, the status pill on the project page turns green ("Running · N/N") once every container is healthy. If a container fails to start, the Logs tab auto-loads with the failing service\'s last 200 lines.',
       },
     ],
   },
@@ -572,12 +668,54 @@ export function DocsProject() {
             <div className="p-4 sm:p-5 space-y-3">
               {s.body && <p className="text-sm text-gray-700 leading-relaxed">{s.body}</p>}
               {s.cmd && <TerminalBlock cmd={s.cmd} />}
+              {s.images && s.images.length > 0 && (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  {s.images.map((img, j) => (
+                    <DocImage key={j} src={img.src} alt={img.alt} caption={img.caption} />
+                  ))}
+                </div>
+              )}
               {s.note && <p className="text-xs text-gray-500 italic leading-relaxed">{s.note}</p>}
             </div>
           </li>
         ))}
       </ol>
     </div>
+  );
+}
+
+/**
+ * Renders a doc screenshot. If the image file isn't present (404), shows
+ * a styled placeholder that surfaces the alt text + expected location —
+ * so the doc still reads well before screenshots are added, and the dev
+ * adding them knows exactly which file to create.
+ */
+function DocImage({ src, alt, caption }: { src: string; alt: string; caption?: string }) {
+  const [errored, setErrored] = useState(false);
+  return (
+    <figure className="rounded-xl border border-gray-200 bg-white overflow-hidden">
+      {errored ? (
+        <div className="aspect-video bg-gray-50 border-b border-gray-200 flex flex-col items-center justify-center p-4 text-center">
+          <div className="w-10 h-10 rounded-full bg-gray-200 text-gray-500 flex items-center justify-center mb-2">
+            <BookOpen size={18} strokeWidth={2.25} />
+          </div>
+          <p className="text-[11px] font-semibold text-gray-600">Screenshot pending</p>
+          <p className="text-[10px] text-gray-500 mt-1 leading-snug">{alt}</p>
+          <code className="mt-2 text-[10px] text-gray-400 font-mono break-all">qcontrol/web/public{src}</code>
+        </div>
+      ) : (
+        <img
+          src={src}
+          alt={alt}
+          onError={() => setErrored(true)}
+          className="w-full aspect-video object-cover bg-gray-100 border-b border-gray-200"
+          loading="lazy"
+        />
+      )}
+      {caption && (
+        <figcaption className="px-3 py-2 text-[11px] text-gray-700 leading-snug">{caption}</figcaption>
+      )}
+    </figure>
   );
 }
 

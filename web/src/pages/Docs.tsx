@@ -169,8 +169,18 @@ Match User sftpuser
     PasswordAuthentication yes
 EOF
 
-# 5. Validate + reload sshd — validation exits non-zero if there's a typo:
-sshd -t && systemctl restart sshd`,
+# 5. Validate + reload sshd — validation exits non-zero if there's a typo.
+#    NOTE: on Ubuntu/Debian the service unit is called "ssh", not "sshd"
+#    (despite the binary name). On RHEL/CentOS/Rocky/Fedora it's "sshd".
+sshd -t && systemctl restart ssh    # Ubuntu/Debian
+# sshd -t && systemctl restart sshd # RHEL/CentOS/Rocky/Fedora
+
+# 6. Verify the chroot config is active for sftpuser:
+sshd -T -C user=sftpuser | grep -iE "chroot|forcecommand|passwordauthentication"
+# Expect three lines:
+#   chrootdirectory /opt
+#   forcecommand internal-sftp
+#   passwordauthentication yes`,
         note: 'Inside sftpuser\'s session, `/` is actually /opt on the host. Test from your laptop with WinSCP (Protocol: SFTP, Host: <vps-ip>, User: sftpuser, Password: <the one you set>) — you should land in a directory that lists the project folders and CANNOT cd above them. Repeat the chgrp + chmod g+rwX step for every new /opt/<project> you add later.',
       },
       {

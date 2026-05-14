@@ -138,7 +138,7 @@ echo "QCONTROL_TOKEN=$TOKEN"`,
       },
       {
         title: 'Wire qcontrol into the reverse-proxy',
-        body: 'qcontrol listens on 127.0.0.1:8089 inside the container. The reverse-proxy publishes it on the public domain over HTTPS.',
+        body: 'qcontrol listens on 127.0.0.1:8089 inside the container. The reverse-proxy publishes it on the public domain over HTTPS. flush_interval -1 is REQUIRED so that streaming action output (Pull + rebuild, etc.) appears in the UI in real-time instead of being buffered until each step finishes.',
         cmd: `# /opt/reverse-proxy/.env — append:
 echo "" >> /opt/reverse-proxy/.env
 echo "QCONTROL_DOMAIN=qcontrol.staging.qbot.now" >> /opt/reverse-proxy/.env
@@ -148,12 +148,15 @@ echo "QCONTROL_UPSTREAM=127.0.0.1:8089" >> /opt/reverse-proxy/.env
 cat >> /opt/reverse-proxy/Caddyfile <<'EOF'
 
 {$QCONTROL_DOMAIN} {
-  reverse_proxy {$QCONTROL_UPSTREAM}
+  reverse_proxy {$QCONTROL_UPSTREAM} {
+    flush_interval -1
+  }
 }
 EOF
 
 cd /opt/reverse-proxy
 docker compose up -d --force-recreate caddy`,
+        note: 'Without flush_interval -1 the qcontrol UI looks frozen during long actions — every build step takes ~30s and you see nothing until the very end. Set it once at install and it Just Works.',
       },
       {
         title: 'DNS A record',
@@ -392,7 +395,52 @@ docker compose up -d --force-recreate caddy`,
     manual: [
       COMMON_MANUAL_BOOTSTRAP,
       {
-        title: 'Pull + rebuild',
+        title: '/opt/qcontrol/.env — required variables',
+        body: 'Created on first install, recreated whenever you add a new peer VPS. Every key listed here must be present, or qcontrol either refuses login (no token) or hides the VPS-switcher (no peers).',
+        cmd: `# /opt/qcontrol/.env
+
+# Mandatory — login token. Generate with: openssl rand -hex 32
+QCONTROL_TOKEN=<64-hex-char-string>
+
+# Multi-VPS handling. Tells qcontrol "what AM I" and "where are my peers".
+# QCONTROL_VPS_NAME labels this VPS in the sidebar; the sidebar dropdown
+# is BUILT from QCONTROL_PEERS_JSON. Put both prod + staging in BOTH VPSes'
+# peer JSON — the entry whose name == QCONTROL_VPS_NAME gets marked "current"
+# and clicking another redirects to its qcontrol URL.
+QCONTROL_VPS_NAME=prod
+QCONTROL_PEERS_JSON=[{"name":"prod","url":"https://qcontrol.qbot.now"},{"name":"staging","url":"https://qcontrol.staging.qbot.now"}]`,
+        note: 'When you spin up a new VPS, update QCONTROL_PEERS_JSON on EVERY existing VPS to include the new entry, then `docker compose ... up -d --force-recreate` qcontrol on each so the dropdown reflects reality.',
+      },
+      {
+        title: 'Reverse-proxy block — must enable flush_interval for live streaming',
+        body: 'qcontrol\'s Pull + rebuild / Up / Rebuild / etc. stream output line-by-line. Caddy buffers responses by default, which makes the UI look frozen until each compose step finishes. Adding `flush_interval -1` forces Caddy to flush every write immediately so output appears in the browser in real-time.',
+        cmd: `# /opt/reverse-proxy/Caddyfile — qcontrol block:
+{$QCONTROL_DOMAIN} {
+  reverse_proxy {$QCONTROL_UPSTREAM} {
+    flush_interval -1
+  }
+}
+
+# Apply:
+cd /opt/reverse-proxy
+docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile`,
+        note: 'Without `flush_interval -1`, you\'ll see the entire action output dumped in one chunk after every step completes — defeating the point of streaming. Set it once when you wire up qcontrol, never think about it again.',
+      },
+      {
+        title: 'Private repo support — host SSH key must be authorized on GitHub',
+        body: 'Pull + rebuild needs git to authenticate against private repos. qcontrol mounts /root/.ssh:ro into its container, so it uses whatever key the VPS\'s root user already has. If pull fails with "Permission denied", grab the public key and add it as a Deploy Key on the GitHub repo.',
+        cmd: `# Generate a key if there isn't one yet:
+ssh-keygen -t ed25519 -C "qcontrol-deploy" -f ~/.ssh/id_ed25519 -N ""
+
+# View the public key:
+cat ~/.ssh/id_ed25519.pub
+
+# Add the printed key on GitHub: repo → Settings → Deploy keys → Add deploy key (read-only is enough for pull).
+# Once added, qcontrol's Pull + rebuild against private repos will Just Work.`,
+        note: 'Tip: qcontrol\'s Confirm modal has a "Show this VPS\'s deploy public key" disclosure right under the private-repo warning. Click it to copy the .pub contents without leaving the UI.',
+      },
+      {
+        title: 'Pull + rebuild qcontrol itself',
         cmd: `cd /opt/qcontrol
 git fetch --all --prune
 git reset --hard origin/main
@@ -411,6 +459,10 @@ docker compose -f docker-compose.yml -f docker-compose.vps.yml logs --tail 200 -
       {
         title: 'You\'re using it',
         body: 'qcontrol manages itself the same way — Projects → qcontrol → Pull + rebuild. The page will disconnect for ~5s while the container restarts; refresh after.',
+      },
+      {
+        title: 'Adding a new VPS to the switcher',
+        body: 'On EVERY existing VPS, edit /opt/qcontrol/.env → update QCONTROL_PEERS_JSON to include the new entry, then run Pull + rebuild on qcontrol itself (or `docker compose ... up -d --force-recreate` manually). The sidebar dropdown picks up the new peer on next page load.',
       },
     ],
   },

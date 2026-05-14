@@ -112,6 +112,28 @@ app.get('/api/peers', (_req, res) => {
   res.json({ self: VPS_NAME, peers: VPS_PEERS });
 });
 
+// ─── host SSH public keys (for private-repo pull) ─────────────────────────
+// When `git pull` runs against a private SSH remote (git@github.com:...),
+// qcontrol uses whichever key the host has at /root/.ssh/. This endpoint
+// reads the *.pub files there so the user can copy the public key and add
+// it as a Deploy Key on the GitHub repo. Read-only — we never expose
+// private keys.
+app.get('/api/host/ssh-public-keys', authed, async (_req, res) => {
+  const sshDir = '/root/.ssh';
+  let entries = [];
+  try { entries = await readdir(sshDir, { withFileTypes: true }); }
+  catch (e) { return res.json({ data: [], error: `cannot read ${sshDir}: ${e.message}` }); }
+  const out = [];
+  for (const e of entries) {
+    if (!e.isFile() || !e.name.endsWith('.pub')) continue;
+    try {
+      const body = await readFile(path.join(sshDir, e.name), 'utf8');
+      out.push({ filename: e.name, content: body.trim() });
+    } catch { /* skip unreadable */ }
+  }
+  res.json({ data: out, count: out.length });
+});
+
 // ─── VPS health (CPU / mem / disk / processes / containers) ──────────────
 //
 // We mount /proc from the host at /host/proc:ro, so reading these files
@@ -556,11 +578,17 @@ function streamCmd(res, label, cmd, args, opts = {}) {
 }
 
 /** Run a sequence of commands, stopping at the first non-zero exit. Writes
- *  a single final marker line so the client knows the action is done. */
+ *  a single final marker line so the client knows the action is done.
+ *  Every write hits the wire immediately — no Node socket buffering, no
+ *  proxy buffering hints, no compression. */
 async function runStreamed(res, steps) {
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
-  res.setHeader('X-Accel-Buffering', 'no'); // disable buffering in nginx if present
+  res.setHeader('X-Accel-Buffering', 'no'); // nginx hint
+  res.setHeader('Transfer-Encoding', 'chunked');
+  // Disable Nagle's algorithm so each res.write() leaves the box immediately
+  // instead of being held up waiting for more bytes to coalesce.
+  try { res.socket?.setNoDelay?.(true); } catch { /* ignore */ }
   res.flushHeaders?.();
   let finalCode = 0;
   for (const step of steps) {
@@ -582,7 +610,16 @@ async function resolveProjectAction(project) {
   const { composeFiles, projectName } = await detectComposeSetup(dir);
   const composeArgs = ['compose'];
   for (const f of composeFiles) composeArgs.push('-f', f);
-  const env = projectName ? { COMPOSE_PROJECT_NAME: projectName } : {};
+  // BUILDKIT_PROGRESS=plain forces buildkit to emit human-readable text
+  // line-by-line. Default is "auto" which uses a fancy interactive TTY
+  // renderer that emits ALMOST NOTHING over a pipe — leading to a UI that
+  // looks frozen for the duration of a 4-minute image build. Plain mode
+  // prints every step as it happens, which is what we want when streaming.
+  const env = {
+    BUILDKIT_PROGRESS: 'plain',
+    DOCKER_BUILDKIT: '1',
+    ...(projectName ? { COMPOSE_PROJECT_NAME: projectName } : {}),
+  };
   return { dir, composeFiles, projectName, composeArgs, env };
 }
 

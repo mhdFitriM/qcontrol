@@ -1,6 +1,95 @@
 import { useEffect, useState } from 'react';
-import { AlertTriangle, KeyRound, Loader2, ShieldAlert, X } from 'lucide-react';
+import { AlertTriangle, Check, ChevronDown, Copy, KeyRound, Loader2, ShieldAlert, X } from 'lucide-react';
 import { api } from '../lib/api';
+
+interface SshPubKey { filename: string; content: string; }
+
+function DeployKeyDisclosure() {
+  const [open, setOpen] = useState(false);
+  const [keys, setKeys] = useState<SshPubKey[] | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [copied, setCopied] = useState<string | null>(null);
+
+  async function load() {
+    try {
+      const r = await api.get<{ data: SshPubKey[]; error?: string }>('/host/ssh-public-keys');
+      if (r.error) setErr(r.error);
+      setKeys(r.data);
+    } catch (e: any) {
+      setErr(e?.body?.message || e.message || 'Failed to load keys');
+    }
+  }
+
+  function toggle() {
+    setOpen((v) => {
+      const next = !v;
+      if (next && !keys && !err) void load();
+      return next;
+    });
+  }
+
+  async function copyKey(content: string) {
+    try {
+      await navigator.clipboard.writeText(content);
+      setCopied(content);
+      setTimeout(() => setCopied(null), 1500);
+    } catch { /* ignore */ }
+  }
+
+  return (
+    <div className="mt-2">
+      <button
+        type="button"
+        onClick={toggle}
+        className="inline-flex items-center gap-1 text-[11px] font-semibold uppercase tracking-wide text-amber-900 hover:text-amber-700 transition-colors"
+      >
+        <ChevronDown size={11} strokeWidth={2.5} className={`transition-transform ${open ? 'rotate-180' : ''}`} />
+        Show this VPS's deploy public key
+      </button>
+      {open && (
+        <div className="mt-2 space-y-2">
+          {!keys && !err && (
+            <div className="text-[11px] text-amber-800 inline-flex items-center gap-1.5">
+              <Loader2 size={11} className="animate-spin" /> Loading…
+            </div>
+          )}
+          {err && <div className="text-[11px] text-red-700">{err}</div>}
+          {keys && keys.length === 0 && (
+            <div className="text-[11px] text-amber-800">
+              No <code className="font-mono">.pub</code> files in <code className="font-mono">/root/.ssh</code> on this VPS. SSH into the host and run:
+              <pre className="mt-1 bg-amber-100/60 rounded px-2 py-1.5 font-mono text-[10px]">ssh-keygen -t ed25519 -C "{`<vps-name>-deploy`}" -f ~/.ssh/id_ed25519 -N ""</pre>
+            </div>
+          )}
+          {keys && keys.length > 0 && (
+            <>
+              <p className="text-[10px] text-amber-900">
+                Paste this into GitHub: repo → Settings → Deploy keys → <strong>Add deploy key</strong>. Read access is enough for <code className="font-mono">git pull</code>.
+              </p>
+              {keys.map((k) => (
+                <div key={k.filename} className="rounded-lg border border-amber-300 bg-white overflow-hidden">
+                  <div className="flex items-center justify-between gap-2 px-2.5 py-1 border-b border-amber-100 bg-amber-50">
+                    <span className="text-[10px] font-mono text-amber-900 truncate">{k.filename}</span>
+                    <button
+                      type="button"
+                      onClick={() => copyKey(k.content)}
+                      className="inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-amber-900 hover:text-amber-700 transition-colors"
+                    >
+                      {copied === k.content ? <Check size={10} strokeWidth={2.5} /> : <Copy size={10} strokeWidth={2.5} />}
+                      {copied === k.content ? 'Copied' : 'Copy'}
+                    </button>
+                  </div>
+                  <pre className="px-2.5 py-2 font-mono text-[10px] text-gray-800 whitespace-pre-wrap break-all max-h-32 overflow-y-auto">
+                    {k.content}
+                  </pre>
+                </div>
+              ))}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
 
 /**
  * Generic "type to confirm" gate for any destructive or non-trivial action.
@@ -106,12 +195,15 @@ export function ConfirmActionModal({
           )}
 
           {plan && needsGit && plan.git.isPrivateLikely && (
-            <div className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2.5 text-[11px] text-amber-900 flex gap-2">
-              <KeyRound size={14} strokeWidth={2.5} className="flex-shrink-0 mt-0.5" />
-              <div>
-                <strong>Private repo (SSH remote).</strong> qcontrol will use the host's <code className="font-mono">/root/.ssh</code> keys.
-                If <code className="font-mono">git pull</code> fails with <em>Permission denied</em>, add a deploy key for this repo to <code className="font-mono">~root/.ssh/authorized_keys</code> on this VPS (matching the public half of <code className="font-mono">~root/.ssh/id_ed25519.pub</code> or whichever key is loaded).
+            <div className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2.5 text-[11px] text-amber-900">
+              <div className="flex gap-2">
+                <KeyRound size={14} strokeWidth={2.5} className="flex-shrink-0 mt-0.5" />
+                <div>
+                  <strong>Private repo (SSH remote).</strong> qcontrol will use this VPS's SSH keys from <code className="font-mono">/root/.ssh</code>.
+                  If <code className="font-mono">git pull</code> fails with <em>Permission denied</em>, you need to add this VPS's public key as a <strong>Deploy Key</strong> on the GitHub repo (Settings → Deploy keys → Add).
+                </div>
               </div>
+              <DeployKeyDisclosure />
             </div>
           )}
 

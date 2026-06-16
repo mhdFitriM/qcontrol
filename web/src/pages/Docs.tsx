@@ -312,48 +312,72 @@ cd /opt/<project>
   {
     slug: 'qrpos',
     name: 'qrpos',
-    blurb: 'Merchant POS — Laravel API + Vite SPA, served at qr.qbot.now via the shared reverse-proxy.',
+    blurb: 'Merchant POS — Laravel API + Vite SPA in a single container (qrpos-app), served at qr.qbot.now via the shared reverse-proxy. Uses the conventional docker-compose.yml + docker-compose.vps.yml pair (no separate production overlay).',
     domains: ['qr.qbot.now'],
     manual: [
       COMMON_MANUAL_BOOTSTRAP,
       {
-        title: 'Pull the latest main',
+        title: 'Easiest path — push to main, CI auto-deploys',
+        body: 'qrpos has a GitHub Actions workflow (.github/workflows/deploy-prod.yml) that SSHes into the VPS on every push to main and runs the full rebuild. For most changes you don\'t touch the VPS at all.',
+        cmd: `# On your laptop, in the qrpos repo:
+git add .
+git commit -m "<your change>"
+git push origin main
+
+# Watch the deploy in Actions:
+# https://github.com/seancreative/qrpos/actions`,
+        note: 'Same pattern as qcontrol / qparking / face_auth. Staging has its own workflow (deploy-staging.yml) on the staging branch.',
+      },
+      {
+        title: 'Manual deploy from the VPS (after git pull)',
+        body: 'Use this when CI is down, when you want to verify a build live, or when you\'ve made an edit directly on the VPS. qrpos has NO deploy.sh — the canonical commands are raw docker compose.',
         cmd: `cd /opt/qrpos
 git fetch --all --prune
 git reset --hard origin/main
-git log -1 --oneline`,
+git log -1 --oneline
+
+# Full rebuild — slowest path (~3 min) but guarantees a clean image:
+docker compose -f docker-compose.yml -f docker-compose.vps.yml build --no-cache app
+docker compose -f docker-compose.yml -f docker-compose.vps.yml up -d --force-recreate --remove-orphans
+docker image prune -f`,
       },
       {
-        title: 'Run the deploy script',
-        body: 'The repo ships a deploy.sh that does the full cycle: build → up → migrate → cache.',
+        title: 'Frontend-only changes — fast path (~30s)',
+        body: 'When the change is React/Vite only (no composer.json, no Dockerfile, no PHP config edits), skip --no-cache so BuildKit reuses the composer + npm install layers. The Vite build still runs fresh because frontend/src/ changed.',
         cmd: `cd /opt/qrpos
-./deploy.sh`,
-        note: 'If deploy.sh isn\'t executable yet: chmod +x deploy.sh',
+git fetch --all --prune && git reset --hard origin/main
+
+# No --no-cache here — much faster:
+docker compose -f docker-compose.yml -f docker-compose.vps.yml build app
+docker compose -f docker-compose.yml -f docker-compose.vps.yml up -d --force-recreate app`,
+        note: 'After deploy, hard-refresh the browser (Ctrl+Shift+R) — Vite produces hashed asset filenames so the browser will fetch the new bundle, but only on a full reload, not a cached navigation.',
       },
       {
         title: 'Watch the rollout',
         cmd: `cd /opt/qrpos
 docker compose -f docker-compose.yml -f docker-compose.vps.yml ps
-docker compose -f docker-compose.yml -f docker-compose.vps.yml logs --tail 100 -f`,
+docker compose -f docker-compose.yml -f docker-compose.vps.yml logs --tail 100 -f app`,
       },
       {
         title: 'Verify',
-        body: 'Hit the public domain — it should serve the latest build.',
-        cmd: `curl -I https://qr.qbot.now`,
+        body: 'Hit the public domain — it should serve the latest build. Then open the site in an incognito window to bypass cache.',
+        cmd: `curl -I https://qr.qbot.now
+# Expected: HTTP/2 200, Server: Caddy, recent Last-Modified.`,
       },
     ],
     viaQcontrol: [
       {
         title: 'Open the project in qcontrol',
-        body: 'Sidebar → Projects → qrpos. The status badge at the top tells you whether the stack is fully up.',
+        body: 'Sidebar → Projects → qrpos. The status badge at the top tells you whether the stack is fully up. Path: /opt/qrpos.',
       },
       {
         title: 'Pull + rebuild in one click',
-        body: 'Press Pull + rebuild. Equivalent to git pull + docker compose build --no-cache + up -d --force-recreate. Output streams to the Action output tab.',
+        body: 'Press Pull + rebuild → type "confirm". qcontrol runs git pull + docker compose build --no-cache + up -d --force-recreate against /opt/qrpos with the conventional compose files. Output streams to the Action output tab in real time.',
+        note: 'Same end result as the manual "Full rebuild" path above. Skip qcontrol\'s button when you want the faster cached build — qcontrol always uses --no-cache.',
       },
       {
         title: 'Check logs if anything is red',
-        body: 'Switch to the Container logs tab — qcontrol auto-loads the last 200 lines whenever any container is not running.',
+        body: 'Switch to the Container logs tab — qcontrol auto-loads the last 200 lines whenever any container is not running. Status badge stays red until every service goes healthy.',
       },
     ],
   },

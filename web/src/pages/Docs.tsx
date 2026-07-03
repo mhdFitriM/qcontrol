@@ -12,6 +12,7 @@ import {
   Code,
   Github,
   ExternalLink,
+  Cpu,
 } from 'lucide-react';
 
 /**
@@ -47,7 +48,13 @@ interface ProjectDoc {
   dev: Step[];
   prod: Step[];
   maintenance: Step[];
+  vpsKnowledge?: Step[];      // optional 5th tab — used by Fresh VPS setup only
 }
+
+const COMMON_SSH_NOTE: Step = {
+  title: 'SSH into the VPS as root',
+  body: 'These commands run on the VPS. If your Linux/WSL laptop has ssh: `ssh root@<vps-host>`. On Windows use PuTTY with your qbot.ppk key (setup screenshots in the Fresh VPS setup docs). All commands below assume you are logged in.',
+};
 
 const COMMON_PUTTY_STEP: Step = {
   title: 'Connect to the VPS with PuTTY',
@@ -290,6 +297,207 @@ sshd -T -C user=sftpuser | grep -iE "chroot|forcecommand"`,
 du -shx /var/lib/docker  # docker overhead
 docker system prune -f   # remove stopped containers + dangling images
 docker image prune -a -f # aggressive: removes all unused images`,
+      },
+    ],
+    vpsKnowledge: [
+      {
+        title: 'Why every Docker project lives in /opt/<name>',
+        body: 'Filesystem-Hierarchy Standard convention. `/opt` is defined as "add-on software" — long-lived third-party services (which every Docker stack effectively is from the host\'s POV). Concretely:\n\n  • /home = user home dirs. Wrong for stacks that live longer than any user.\n  • /var = system-managed logs + databases. Docker already writes there via /var/lib/docker.\n  • /srv = "data served by this system" (websites, FTP). Historically LSB but rarely used.\n  • /opt = the right home for self-contained, mount-anywhere Docker stacks.\n\nUsing /opt uniformly means: backups have one root to grep, permissions are consistent (root:sftpusers 775), deploy scripts can assume /opt/<slug>, and the SFTP chroot works out of the box.',
+      },
+      {
+        title: 'Keeping the VPS itself up-to-date',
+        body: 'Once a month or after a security advisory. Kernel updates need a reboot; everything else is live.',
+        cmd: `# 1. Fetch package index + upgrade everything installed:
+apt-get update
+apt-get upgrade -y            # bug/security fixes
+apt-get dist-upgrade -y       # ALSO installs new deps (may pull new kernel)
+
+# 2. Remove obsolete packages:
+apt-get autoremove -y
+apt-get autoclean
+
+# 3. Check if a reboot is required (kernel or libc updated):
+[ -f /var/run/reboot-required ] && echo "REBOOT REQUIRED" || echo "no reboot needed"
+cat /var/run/reboot-required.pkgs 2>/dev/null   # which pkgs need it
+
+# 4. If yes — WARN in the team channel first, then:
+shutdown -r now     # or:  systemctl reboot`,
+        note: 'Reboots kill every container. After boot, Docker\'s restart policy (unless-stopped / always in our compose files) brings them back — usually. Verify: `docker ps` should list everything within 30s.',
+      },
+      {
+        title: 'Checking listening ports — who has 3306 / 8080 / 443?',
+        body: 'When a deploy says "port already in use", find the culprit.',
+        cmd: `# ss is the modern replacement for netstat (already installed on Ubuntu):
+ss -tlnp                             # all TCP listeners
+ss -tlnp | grep :3306                # who owns MySQL port
+ss -tlnp sport = :443                # who owns HTTPS
+
+# Legacy netstat (only if you insist):
+netstat -tlnp | grep 3306
+
+# Once you know the port is taken, find the container:
+docker ps --format '{{.Names}}\\t{{.Ports}}' | grep 3306
+
+# Or the host process:
+lsof -i :3306                        # apt-get install lsof
+fuser -n tcp 3306                    # alternative`,
+      },
+      {
+        title: 'Checking RAM',
+        cmd: `# Human-readable snapshot:
+free -h
+#                total   used   free  shared  buff/cache  available
+# Mem:            3.8Gi  1.2Gi  180Mi   32Mi     2.4Gi      2.4Gi   ← "available" is what matters
+# Swap:           2.0Gi  120Mi  1.9Gi
+
+# Per-container memory:
+docker stats --no-stream
+
+# Sorted by RSS (biggest first):
+ps aux --sort=-rss | head -20`,
+        note: '"available" (not "free") is the real number. Linux uses spare RAM as disk cache — high "used" is normal and healthy. If "available" drops below ~200 MB the OOM killer is minutes away from firing.',
+      },
+      {
+        title: 'htop — live view of everything',
+        body: 'Better `top`: coloured, sortable, keyboard-driven. If not installed: `apt-get install -y htop`.',
+        cmd: `htop
+# Inside htop:
+#   F2   Setup    — toggle columns (add IO_READ_RATE / IO_WRITE_RATE for disk)
+#   F3   Search   — jump to a process by name
+#   F4   Filter   — hide everything except matching processes
+#   F5   Tree     — see parent/child (Docker daemon → containerd → containers)
+#   F6   Sort by  — CPU%, MEM%, TIME, PID
+#   F9   Kill     — sends signal to selected process
+#   /    Same as F3
+#   u    Filter by user (pick www-data to see all PHP-FPM workers)
+#   H    Show/hide user threads
+#   K    Show/hide kernel threads
+#   q    Quit`,
+      },
+      {
+        title: 'Disk usage — where did 40 GB go?',
+        cmd: `df -h                            # per-filesystem
+df -h /var/lib/docker            # is docker filling up?
+
+# Biggest directories (top-level):
+du -shx /* 2>/dev/null | sort -hr | head -20
+
+# Docker-specific:
+docker system df                 # what's using docker's disk
+docker system df -v              # per-image / per-volume breakdown
+
+# Log spam (journald):
+journalctl --disk-usage
+journalctl --vacuum-time=7d      # keep last 7 days only
+
+# Container logs (docker's own — not journald):
+du -sh /var/lib/docker/containers/*/*-json.log | sort -hr | head`,
+        note: 'If /var/lib/docker is huge: `docker system prune -f` removes stopped containers + dangling images. `docker image prune -a -f` removes ALL unused images (aggressive but reversible — you just re-pull/rebuild next deploy).',
+      },
+      {
+        title: 'CPU load + who is burning it',
+        cmd: `# 1-min / 5-min / 15-min load averages (compare to CPU count):
+uptime
+nproc                       # how many CPUs — load 1.0 per CPU = fully busy
+
+# Top CPU consumers:
+ps aux --sort=-%cpu | head -20
+
+# Per-container:
+docker stats --no-stream --format 'table {{.Name}}\\t{{.CPUPerc}}\\t{{.MemUsage}}'`,
+      },
+      {
+        title: 'Reading systemd + docker logs',
+        cmd: `# systemd services (any *.service you set up):
+systemctl status <service>
+systemctl restart <service>
+journalctl -u <service> -f --tail 200
+
+# Docker daemon itself:
+journalctl -u docker.service -f
+
+# Container logs — both patterns:
+docker logs <container-name> --tail 200 -f
+cd /opt/<project> && docker compose logs -f <service>
+
+# Anything to stderr on the console during boot:
+dmesg | tail -50`,
+      },
+      {
+        title: 'Users, sudo, and who is currently logged in',
+        cmd: `who                    # who's logged in RIGHT NOW
+last -n 20             # last 20 logins (audit trail)
+lastb -n 20            # last 20 FAILED login attempts (brute-force check)
+
+# List all users with a shell:
+grep -E "/bin/(bash|zsh|sh)$" /etc/passwd
+
+# Add / remove sudo:
+usermod -aG sudo <user>
+gpasswd -d <user> sudo
+
+# Root's SSH-authorized public keys:
+cat /root/.ssh/authorized_keys`,
+      },
+      {
+        title: 'Firewall — UFW cheat sheet',
+        cmd: `ufw status verbose            # show all rules
+ufw allow OpenSSH             # port 22
+ufw allow 80                  # HTTP (Caddy)
+ufw allow 443                 # HTTPS (Caddy)
+ufw allow from 1.2.3.4 to any port 3306   # DB port only from this office IP
+ufw delete allow 3306          # remove a rule
+ufw disable                   # PANIC BUTTON — only if you\'re locked out via console`,
+        note: 'Never `ufw enable` without first allowing OpenSSH — you\'ll lock yourself out of the VPS. The default-deny will kill your active SSH session too. Test rules from a second SSH session before disabling the first.',
+      },
+      {
+        title: 'DNS + connectivity tests',
+        cmd: `# Does the domain point here?
+dig +short qr.qbot.now A       # should return this VPS's IPv4
+dig +short qr.qbot.now AAAA    # IPv6 (if you use it)
+
+# Can this VPS resolve outbound?
+dig +short google.com          # sanity check DNS
+curl -I https://github.com     # sanity check HTTPS egress
+
+# Traceroute (when a client says "the site is slow from Malaysia"):
+mtr -rw --report-cycles 20 qr.qbot.now
+traceroute qr.qbot.now`,
+      },
+      {
+        title: 'Backup best practices for this VPS',
+        body: 'Rule of thumb: if it lives only on this VPS, it\'s gone tomorrow. Always have a copy elsewhere.',
+        cmd: `# 1. MySQL dumps live in /opt/<project>/data/backups/ (per-project cron).
+# 2. Weekly full snapshot at the hypervisor level (DigitalOcean / Linode / Contabo panel).
+# 3. Off-site copy of /opt/reverse-proxy/{.env,Caddyfile} — this is the ONE
+#    config that binds every project to its domain. Losing it means rebuilding
+#    every reverse_proxy block from memory. Push it to a private GitHub repo:
+
+cd /opt/reverse-proxy
+git init
+git remote add origin git@github.com:mhdFitriM/reverse-proxy.git
+git add .env Caddyfile
+git commit -m "snapshot $(date +%F)"
+git push -u origin main`,
+      },
+      {
+        title: 'Emergency: locked out of SSH',
+        body: 'If you break sshd_config, a firewall rule, or authorized_keys, your terminal freezes but the VPS is still running. Recovery:',
+        cmd: `# 1. Open the hypervisor console (DigitalOcean → Droplet → Access → Recovery Console).
+# 2. Log in as root with the panel password (or "Reset root password" first).
+# 3. Undo the last change:
+#      cat /etc/ssh/sshd_config.d/10-sftpuser.conf
+#      systemctl restart ssh
+#      ufw disable
+# 4. THEN reconnect via SSH and fix properly.
+
+# Prevention: before touching sshd_config, ALWAYS have a second SSH session
+# open in another window — if the reload breaks new logins, the existing one
+# can undo the change.`,
+      },
+      {
+        title: 'Read the shared reverse-proxy port table before adding a new project',
+        body: 'Every project on this VPS binds to a specific loopback port. See the reverse-proxy project docs (Start Fresh tab) for the canonical table. Pick the next free number in the 80xx range — never reuse a port, never bind to 0.0.0.0 (that would collide with Caddy on 80/443).',
       },
     ],
   },
@@ -646,11 +854,23 @@ docker compose -f docker-compose.yml -f docker-compose.vps.yml exec app php arti
 docker compose -f docker-compose.yml -f docker-compose.vps.yml exec app php artisan view:cache`,
       },
       {
-        title: 'Reset the MySQL volume (destructive!)',
+        title: '⚠ DANGER — reset the MySQL volume (WIPES DATABASE)',
+        body: '🚨 STOP AND READ. `docker compose down -v` deletes ALL named volumes for this stack — including the MySQL data volume. Every row in every table is GONE. There is NO undo. Only run this if:\n  1. You have a fresh backup you\'ve verified (mysqldump on your laptop, downloaded — not left on the VPS)\n  2. AND you are 100% sure you\'re on the right VPS (never on prod without an incident ticket)\n  3. AND you\'ve announced it in the team channel first\n\nIf you\'re just trying to fix a stuck migration, use `php artisan migrate:rollback` or fix the migration file — DO NOT reach for -v.',
         cmd: `cd /opt/qrpos
-docker compose -f docker-compose.yml -f docker-compose.vps.yml down -v
+
+# 1. Take a backup FIRST (do not skip):
+docker compose -f docker-compose.yml -f docker-compose.vps.yml exec mysql \\
+  mysqldump -u root -p"$DB_ROOT_PASSWORD" qrpos > /tmp/qrpos-backup-$(date +%Y%m%d-%H%M%S).sql
+ls -lh /tmp/qrpos-backup-*.sql   # confirm the file exists + has bytes
+
+# 2. Download the backup to your laptop (WinSCP / pscp) — do NOT trust the VPS
+#    to still have it if this step fails.
+
+# 3. Only NOW run the destructive command:
+docker compose -f docker-compose.yml -f docker-compose.vps.yml down -v   # ← WIPES DB
 docker compose -f docker-compose.yml -f docker-compose.vps.yml up -d
 docker compose -f docker-compose.yml -f docker-compose.vps.yml exec app php artisan migrate --force`,
+        note: 'The `-v` flag on `docker compose down` is the single most dangerous flag in this entire doc. Even seasoned engineers have wiped prod DBs by muscle-memory-typing `down -v` when they meant `down`. There is no "are you sure?" — the command executes instantly. Slow down.',
       },
     ],
   },
@@ -1332,7 +1552,7 @@ docker compose up -d --scale queue=3`,
     domains: ['api-old.aigenius.now'],
     reverseProxyPort: '127.0.0.1:8091 (php artisan serve)',
     start: [
-      COMMON_PUTTY_STEP,
+      COMMON_SSH_NOTE,
       {
         title: 'Install PHP 8.2 + composer on the VPS (once)',
         body: 'This project runs directly on host PHP — no container. Install the runtime + composer if not already there.',
@@ -1442,7 +1662,7 @@ php artisan serve
       },
     ],
     prod: [
-      COMMON_PUTTY_STEP,
+      COMMON_SSH_NOTE,
       {
         title: 'Redeploy (git pull + composer + migrate + reload service)',
         cmd: `cd /opt/aigenius-backend-old
@@ -1532,7 +1752,7 @@ systemctl restart aigenius-backend-old`,
     domains: ['checkin.fisb.qbot.now'],
     reverseProxyPort: '127.0.0.1:8092 (php artisan serve OR php-fpm socket)',
     start: [
-      COMMON_PUTTY_STEP,
+      COMMON_SSH_NOTE,
       {
         title: 'Install PHP 8.2 + composer + node (once per VPS)',
         cmd: `add-apt-repository -y ppa:ondrej/php
@@ -1650,7 +1870,7 @@ cd android
       },
     ],
     prod: [
-      COMMON_PUTTY_STEP,
+      COMMON_SSH_NOTE,
       {
         title: 'Redeploy backend',
         cmd: `cd /opt/qbot-checkin
@@ -1758,7 +1978,7 @@ systemctl restart qbot-checkin  # or: systemctl reload php8.2-fpm`,
     domains: ['wonderstar.qbot.now'],
     reverseProxyPort: 'static file_server (no upstream port)',
     start: [
-      COMMON_PUTTY_STEP,
+      COMMON_SSH_NOTE,
       {
         title: 'Install Node 20 on the VPS (once)',
         cmd: `curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
@@ -1851,7 +2071,7 @@ npm run preview
       },
     ],
     prod: [
-      COMMON_PUTTY_STEP,
+      COMMON_SSH_NOTE,
       {
         title: 'Redeploy (git pull + build)',
         body: 'Because it\'s a static bundle, "deploy" is just rebuild + Caddy picks it up on the next request (no restart needed — file_server reads from disk).',
@@ -2052,13 +2272,14 @@ export function DocsIndex() {
   );
 }
 
-type TabKey = 'start' | 'dev' | 'prod' | 'maintenance';
+type TabKey = 'start' | 'dev' | 'prod' | 'maintenance' | 'vpsKnowledge';
 
 const TAB_META: { key: TabKey; label: string; icon: typeof TerminalIcon }[] = [
   { key: 'start', label: 'Start Fresh', icon: Rocket },
   { key: 'dev', label: 'Dev Mode', icon: Code },
   { key: 'prod', label: 'Prod Mode', icon: Server },
   { key: 'maintenance', label: 'Maintenance', icon: Wrench },
+  { key: 'vpsKnowledge', label: 'VPS Knowledge', icon: Cpu },
 ];
 
 export function DocsProject() {
@@ -2081,7 +2302,10 @@ export function DocsProject() {
     );
   }
 
-  const steps = doc[tab];
+  const steps: Step[] = (doc[tab] as Step[] | undefined) ?? [];
+  const visibleTabs = TAB_META.filter(
+    (t) => t.key !== 'vpsKnowledge' || (doc.vpsKnowledge && doc.vpsKnowledge.length > 0),
+  );
 
   return (
     <div className="p-5 sm:p-8 max-w-4xl">
@@ -2116,7 +2340,7 @@ export function DocsProject() {
       </div>
 
       <div className="mt-5 inline-flex bg-gray-100 rounded-lg p-1 gap-1 flex-wrap">
-        {TAB_META.map(({ key, label, icon: Icon }) => (
+        {visibleTabs.map(({ key, label, icon: Icon }) => (
           <button
             key={key}
             onClick={() => setTab(key)}

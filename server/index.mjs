@@ -843,6 +843,23 @@ app.post('/api/revproxy/recreate', authed, async (_req, res) => {
   res.status(result.ok ? 200 : 400).json(result);
 });
 
+/**
+ * Danger-zone action: stop the Caddy container. Every domain on this VPS
+ * returns 502 until someone runs `docker compose up -d` on the host. UI
+ * routes this through a "type confirm" modal.
+ */
+app.post('/api/revproxy/stop', authed, async (_req, res) => {
+  try {
+    const { stdout, stderr } = await execP(
+      'docker compose -f docker-compose.yml stop caddy',
+      { cwd: REVERSE_PROXY_DIR, timeout: 30000 },
+    );
+    res.json({ ok: true, log: stdout + stderr });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: 'stop_failed', log: (e.stdout || '') + (e.stderr || String(e)) });
+  }
+});
+
 // ─── destroy / remove project ───────────────────────────────────────────
 
 /** Slug-safe identifier (a-z 0-9 dash). */

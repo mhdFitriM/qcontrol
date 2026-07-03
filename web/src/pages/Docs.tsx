@@ -1322,255 +1322,600 @@ docker compose up -d --scale queue=3`,
   },
 
   // ---------------------------------------------------------------------------
-  // AIGENIUS BACKEND (OLD)
+  // AIGENIUS BACKEND (OLD) — Laravel-on-host, NO Docker
   // ---------------------------------------------------------------------------
   {
     slug: 'aigenius-backend-old',
-    name: 'aigenius-backend (OLD)',
+    name: 'aigenius-backend (OLD) — no Docker',
     repo: 'https://github.com/craveasiadev/aigeniusBackend.git',
-    blurb: 'Legacy AI-Genius backend — Laravel only, no bundled frontend. Kept running for the WordPress plugin variant (wp-aigenius) which still points at this API. Do NOT use for new deployments — use aigenius-full instead.',
+    blurb: 'Legacy Fiuu payment-gateway proxy for the React/Supabase frontend. Laravel 12 + SQLite — runs directly on host PHP-FPM (NO Docker). Only handles /payments/initiate, /payments/callback (Fiuu webhook), /payments/return, /payments/transaction/{id}, /health. All user/order state lives in Supabase — this backend is stateless except for a small payment_transactions table.',
     domains: ['api-old.aigenius.now'],
-    reverseProxyPort: '127.0.0.1:8091',
+    reverseProxyPort: '127.0.0.1:8091 (php artisan serve)',
     start: [
       COMMON_PUTTY_STEP,
       {
-        title: 'Clone + .env',
+        title: 'Install PHP 8.2 + composer on the VPS (once)',
+        body: 'This project runs directly on host PHP — no container. Install the runtime + composer if not already there.',
+        cmd: `# PHP 8.2 (from Ondrej PPA on Ubuntu):
+add-apt-repository -y ppa:ondrej/php
+apt-get update
+apt-get install -y php8.2-cli php8.2-fpm php8.2-mbstring php8.2-xml \\
+                   php8.2-sqlite3 php8.2-curl php8.2-bcmath php8.2-zip \\
+                   php8.2-tokenizer unzip
+
+# Composer:
+curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+composer --version   # should print 2.x`,
+      },
+      {
+        title: 'Clone + install',
         cmd: `cd /opt
 git clone https://github.com/craveasiadev/aigeniusBackend.git aigenius-backend-old
 cd aigenius-backend-old
+
+composer install --no-dev --optimize-autoloader
 cp .env.example .env
+php artisan key:generate
+
+# Create the SQLite DB file:
+touch database/database.sqlite
+chmod 664 database/database.sqlite
+
 vi .env
-# Similar to aigenius-full but WITHOUT frontend vars.
-# Ensure APP_URL=https://api-old.aigenius.now  and  TRUSTED_PROXIES=*`,
+# Required lines:
+#   APP_URL=https://api-old.aigenius.now
+#   FRONTEND_URL=https://aigenius.now
+#   DB_CONNECTION=sqlite
+#   DB_DATABASE=/opt/aigenius-backend-old/database/database.sqlite
+#   FIUU_MERCHANT_ID=...
+#   FIUU_VERIFY_KEY=...
+#   FIUU_SECRET_KEY=...
+#   SUPABASE_URL=...          SUPABASE_SERVICE_KEY=...
+#   TRUSTED_PROXIES=*         # Caddy terminates TLS
+#   APP_ENV=production        APP_DEBUG=false
+
+php artisan migrate --force
+php artisan storage:link
+php artisan config:cache && php artisan route:cache && php artisan view:cache`,
       },
       {
-        title: 'First build',
-        cmd: `docker compose -f docker-compose.yml -f docker-compose.vps.yml build --no-cache
-docker compose -f docker-compose.yml -f docker-compose.vps.yml up -d
-docker compose -f docker-compose.yml -f docker-compose.vps.yml exec app php artisan migrate --force`,
-        note: 'If the repo has no vps overlay, use just docker-compose.yml and bind the app port to 127.0.0.1:8091 via HTTP_BIND / HTTP_PORT env vars.',
+        title: 'Fix filesystem perms (Laravel writes to storage/ + bootstrap/cache/)',
+        cmd: `cd /opt/aigenius-backend-old
+chown -R www-data:www-data storage bootstrap/cache database
+chmod -R 775 storage bootstrap/cache
+chmod 664 database/database.sqlite`,
+      },
+      {
+        title: 'Serve — pick ONE (systemd + php-fpm behind Caddy is cleanest)',
+        body: "Two options, both work. Option A is a lightweight systemd unit that runs `php artisan serve` on 127.0.0.1:8091 (simplest — no php-fpm pool needed since traffic is tiny). Option B is a real php-fpm pool + Caddy php_fastcgi — proper prod. Start with Option A.",
+        cmd: `# ---- Option A: systemd unit around php artisan serve ----
+cat > /etc/systemd/system/aigenius-backend-old.service <<'EOF'
+[Unit]
+Description=aigenius-backend-old (Laravel payment proxy)
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/aigenius-backend-old
+ExecStart=/usr/bin/php artisan serve --host=127.0.0.1 --port=8091 --env=production
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now aigenius-backend-old
+systemctl status aigenius-backend-old
+
+# ---- Option B (better for real prod): php-fpm pool + Caddy php_fastcgi ----
+# See maintenance tab.`,
       },
       COMMON_REVERSE_PROXY_STEP('api-old.aigenius.now', 'AIGENIUS_OLD', '127.0.0.1:8091'),
     ],
     dev: [
       {
-        title: 'Local dev',
+        title: 'Local dev (Windows / macOS / Linux)',
         cmd: `git clone https://github.com/craveasiadev/aigeniusBackend.git
 cd aigeniusBackend
+
+composer install
 cp .env.example .env
-docker compose up -d
-docker compose exec app php artisan migrate --seed`,
+php artisan key:generate
+
+touch database/database.sqlite
+php artisan migrate
+
+# Run the built-in dev server:
+php artisan serve
+# → http://127.0.0.1:8000`,
+      },
+      {
+        title: 'Test the payment flow locally against Fiuu sandbox',
+        cmd: `# In .env set:
+#   FIUU_PAYMENT_URL=https://sandbox.merchant.razer.com/RMS/pay/<merchant>/
+#   FRONTEND_URL=http://localhost:5173
+# Then from the aigenius-full React frontend, checkout hits POST /payments/initiate
+# on http://localhost:8000 which redirects to Fiuu sandbox.`,
       },
     ],
     prod: [
+      COMMON_PUTTY_STEP,
       {
-        title: 'Manual redeploy',
+        title: 'Redeploy (git pull + composer + migrate + reload service)',
         cmd: `cd /opt/aigenius-backend-old
-git fetch --all --prune && git reset --hard origin/main
-docker compose -f docker-compose.yml -f docker-compose.vps.yml build --no-cache
-docker compose -f docker-compose.yml -f docker-compose.vps.yml up -d --force-recreate`,
+git fetch --all --prune
+git reset --hard origin/main
+
+composer install --no-dev --optimize-autoloader
+php artisan migrate --force
+php artisan config:cache && php artisan route:cache && php artisan view:cache
+
+systemctl restart aigenius-backend-old
+systemctl status aigenius-backend-old --no-pager`,
       },
       {
         title: 'Migration plan to aigenius-full',
-        body: 'Long-term: point wp-aigenius at the new aigenius-full API and retire this stack. Coordinate with whoever owns the WordPress plugin before killing.',
+        body: 'Long-term: point the React frontend at aigenius-full and retire this proxy. Payment history table is small — export via `php artisan tinker` + JSON dump before decommissioning.',
       },
     ],
     maintenance: [
       {
         title: 'Tail logs',
-        cmd: `cd /opt/aigenius-backend-old
-docker compose -f docker-compose.yml -f docker-compose.vps.yml logs --tail 200 -f app`,
+        cmd: `# Laravel log:
+tail -f /opt/aigenius-backend-old/storage/logs/laravel.log
+
+# systemd stdout:
+journalctl -u aigenius-backend-old -f --tail 200`,
       },
       {
-        title: 'Storage link missing after deploy',
-        cmd: `docker compose exec app php artisan storage:link`,
+        title: 'SQLite "database is locked"',
+        body: 'Concurrent writes to the payment_transactions table can lock the file briefly. Enable WAL mode for better concurrency.',
+        cmd: `sqlite3 /opt/aigenius-backend-old/database/database.sqlite "PRAGMA journal_mode=WAL;"`,
+      },
+      {
+        title: 'Switching to Option B — real php-fpm pool',
+        cmd: `# 1. Create a dedicated fpm pool:
+cat > /etc/php/8.2/fpm/pool.d/aigenius-old.conf <<'EOF'
+[aigenius-old]
+user = www-data
+group = www-data
+listen = /run/php/php8.2-fpm-aigenius-old.sock
+listen.owner = www-data
+listen.group = www-data
+pm = dynamic
+pm.max_children = 5
+pm.start_servers = 2
+pm.min_spare_servers = 1
+pm.max_spare_servers = 3
+EOF
+systemctl restart php8.2-fpm
+
+# 2. In /opt/reverse-proxy/Caddyfile, replace the reverse_proxy block with:
+{$AIGENIUS_OLD_DOMAIN} {
+  root * /opt/aigenius-backend-old/public
+  php_fastcgi unix//run/php/php8.2-fpm-aigenius-old.sock
+  file_server
+}
+
+# 3. Disable the systemd unit (no longer serving):
+systemctl disable --now aigenius-backend-old
+cd /opt/reverse-proxy && docker compose up -d --force-recreate caddy`,
+      },
+      {
+        title: 'Fiuu webhook signature mismatch',
+        cmd: `# Verify VERIFY_KEY + SECRET_KEY match Fiuu merchant console:
+grep FIUU /opt/aigenius-backend-old/.env
+# Then check the callback log:
+tail -100 storage/logs/laravel.log | grep -i "fiuu\\|payment"`,
+      },
+      {
+        title: 'Clear + rewarm caches after config change',
+        cmd: `cd /opt/aigenius-backend-old
+php artisan optimize:clear
+php artisan config:cache && php artisan route:cache && php artisan view:cache
+systemctl restart aigenius-backend-old`,
       },
     ],
   },
 
   // ---------------------------------------------------------------------------
-  // QBOT-CHECKIN (FISB)
+  // QBOT-CHECKIN (FISB) — Laravel-on-host + Capacitor, NO Docker
   // ---------------------------------------------------------------------------
   {
     slug: 'qbot-checkin',
-    name: 'qbot-checkin (FISB Check-in)',
+    name: 'qbot-checkin (FISB) — no Docker',
     repo: 'https://github.com/craveasiadev/qbot-checkin.git',
-    blurb: 'FISB event check-in — Laravel 11 API + Capacitor Android/iOS mobile client. Backend runs on VPS; APK is distributed separately to event staff. Same Laravel container serves the admin web dashboard.',
+    blurb: 'FISB event check-in — Laravel 12 backend (Blade views) + Capacitor WebView Android shell. Runs directly on host PHP-FPM (NO Docker). The Android app is a thin WebView pointed at CAPACITOR_SERVER_URL — no offline bundling.',
     domains: ['checkin.fisb.qbot.now'],
-    reverseProxyPort: '127.0.0.1:8092',
+    reverseProxyPort: '127.0.0.1:8092 (php artisan serve OR php-fpm socket)',
     start: [
       COMMON_PUTTY_STEP,
       {
-        title: 'Clone + .env',
+        title: 'Install PHP 8.2 + composer + node (once per VPS)',
+        cmd: `add-apt-repository -y ppa:ondrej/php
+apt-get update
+apt-get install -y php8.2-cli php8.2-fpm php8.2-mbstring php8.2-xml \\
+                   php8.2-mysql php8.2-sqlite3 php8.2-curl php8.2-bcmath \\
+                   php8.2-zip php8.2-tokenizer unzip
+
+curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+
+# Node 20 (Capacitor + Vite build):
+curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+apt-get install -y nodejs`,
+      },
+      {
+        title: 'Clone + install',
         cmd: `cd /opt
 git clone https://github.com/craveasiadev/qbot-checkin.git
 cd qbot-checkin
+
+composer install --no-dev --optimize-autoloader
+npm ci
+npm run build   # compile Vite assets into public/build
+
 cp .env.example .env
+php artisan key:generate
+
 vi .env
-# Required:
+# Required lines:
+#   APP_NAME="FISB Check-In"
+#   APP_ENV=production          APP_DEBUG=false
 #   APP_URL=https://checkin.fisb.qbot.now
-#   APP_KEY=              # docker compose run --rm app php artisan key:generate --show
-#   DB_PASSWORD=...
 #   API_BASE_URL=https://checkin.fisb.qbot.now
-#   CAPACITOR_SERVER_URL=https://checkin.fisb.qbot.now`,
+#   CAPACITOR_SERVER_URL=https://checkin.fisb.qbot.now
+#   DB_CONNECTION=sqlite       # or mysql — see below
+#   DB_DATABASE=/opt/qbot-checkin/database/database.sqlite
+
+# If SQLite:
+touch database/database.sqlite
+chmod 664 database/database.sqlite
+
+php artisan migrate --force
+php artisan storage:link
+php artisan config:cache && php artisan route:cache && php artisan view:cache`,
+        note: 'For real events with lots of concurrent check-ins, switch DB_CONNECTION to mysql — SQLite locks under load. Install mysql-server + create db, then update .env accordingly.',
       },
       {
-        title: 'First build',
-        cmd: `docker compose -f docker-compose.yml -f docker-compose.vps.yml build --no-cache
-docker compose -f docker-compose.yml -f docker-compose.vps.yml up -d
-docker compose -f docker-compose.yml -f docker-compose.vps.yml exec app php artisan migrate --seed
-docker compose -f docker-compose.yml -f docker-compose.vps.yml exec app php artisan storage:link`,
+        title: 'Fix filesystem perms',
+        cmd: `cd /opt/qbot-checkin
+chown -R www-data:www-data storage bootstrap/cache database public/build
+chmod -R 775 storage bootstrap/cache
+chmod 664 database/database.sqlite 2>/dev/null || true`,
+      },
+      {
+        title: 'Serve via systemd + php artisan serve',
+        cmd: `cat > /etc/systemd/system/qbot-checkin.service <<'EOF'
+[Unit]
+Description=qbot-checkin (FISB Laravel)
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/qbot-checkin
+ExecStart=/usr/bin/php artisan serve --host=127.0.0.1 --port=8092 --env=production
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now qbot-checkin
+systemctl status qbot-checkin --no-pager`,
+        note: 'For real prod use php-fpm instead (see Maintenance tab). php artisan serve is fine for demos + small events.',
       },
       COMMON_REVERSE_PROXY_STEP('checkin.fisb.qbot.now', 'QBOT_CHECKIN', '127.0.0.1:8092'),
     ],
     dev: [
       {
-        title: 'Backend dev (Laravel + Vite)',
+        title: 'Backend dev (Windows / macOS / Linux)',
         cmd: `git clone https://github.com/craveasiadev/qbot-checkin.git
 cd qbot-checkin
+
+composer install
+npm install
 cp .env.example .env
-docker compose up -d
-docker compose exec app composer install
-docker compose exec app php artisan migrate --seed
-# Backend at http://localhost:8000`,
+php artisan key:generate
+
+touch database/database.sqlite    # or configure MySQL + start it
+php artisan migrate --seed
+
+# Run backend + Vite HMR concurrently:
+php artisan serve        # http://127.0.0.1:8000
+# In another terminal:
+npm run dev              # Vite HMR on :5173`,
       },
       {
-        title: 'Android APK build',
+        title: 'Android APK (Capacitor) — build for testing',
         cmd: `# Requires Android Studio + JDK 17 + Android SDK 34
-npm install
-npm run build          # bake Vite bundle into public/
-npx cap sync android
+# In capacitor.config.ts set CAPACITOR_SERVER_URL to your laptop's LAN IP:
+#   server: { url: 'http://192.168.x.x:8000', cleartext: true }
+# (cleartext ONLY for dev — remove before shipping)
+
+npm run build:mobile          # separate vite.mobile.config.js output
+npm run cap:add:android       # once, to generate android/ folder
+npm run cap:sync              # every time JS changes
+npm run cap:open:android      # opens Android Studio — build APK from there
+
+# Or from the command line:
 cd android
 ./gradlew assembleDebug
 # APK: android/app/build/outputs/apk/debug/app-debug.apk`,
       },
-      {
-        title: 'Live-reload against local backend',
-        cmd: `# In capacitor.config.ts set:
-#   server: { url: 'http://<your-laptop-lan-ip>:8000', cleartext: true }
-# Then install the debug APK on a phone on the same WiFi.
-# Reset to production before shipping:
-#   server: { url: 'https://checkin.fisb.qbot.now' }`,
-      },
     ],
     prod: [
+      COMMON_PUTTY_STEP,
       {
-        title: 'Backend deploy',
+        title: 'Redeploy backend',
         cmd: `cd /opt/qbot-checkin
-git fetch --all --prune && git reset --hard origin/main
-docker compose -f docker-compose.yml -f docker-compose.vps.yml build --no-cache app
-docker compose -f docker-compose.yml -f docker-compose.vps.yml up -d --force-recreate app
-docker compose -f docker-compose.yml -f docker-compose.vps.yml exec app php artisan migrate --force`,
+git fetch --all --prune
+git reset --hard origin/main
+
+composer install --no-dev --optimize-autoloader
+npm ci
+npm run build
+
+php artisan migrate --force
+php artisan config:cache && php artisan route:cache && php artisan view:cache
+chown -R www-data:www-data storage bootstrap/cache public/build
+
+systemctl restart qbot-checkin
+systemctl status qbot-checkin --no-pager`,
       },
       {
-        title: 'APK release build',
-        cmd: `# On the build machine (Windows with Android Studio):
-npm run build
+        title: 'APK release build (on the Windows build box)',
+        cmd: `# Ensure capacitor.config.ts server.url = https://checkin.fisb.qbot.now
+# and cleartext is NOT set.
+
+npm ci
+npm run build:mobile
 npx cap sync android
+
 cd android
 ./gradlew assembleRelease
 # Signed APK: android/app/build/outputs/apk/release/app-release.apk
-# Distribute via mobile-dist/ folder or Google Drive`,
-      },
-    ],
-    maintenance: [
-      {
-        title: 'Tail backend logs',
-        cmd: `cd /opt/qbot-checkin
-docker compose -f docker-compose.yml -f docker-compose.vps.yml logs --tail 200 -f app`,
-      },
-      {
-        title: 'Mobile app can\'t reach API',
-        cmd: `# 1. Verify DNS + TLS:
-curl -I https://checkin.fisb.qbot.now/api/health
-
-# 2. Verify Capacitor server URL matches:
-grep server capacitor.config.ts
-
-# 3. Android cleartext (HTTP) is blocked by default — always use HTTPS in prod.`,
-      },
-      {
-        title: 'Event day surge — DB slow',
-        body: 'Check-ins spike heavily. If MySQL CPU hits 100% during an event, scale up the vpsu instance temporarily, or add a Redis cache for the /api/attendees list.',
-        cmd: `docker stats  # watch CPU per container`,
-      },
-    ],
-  },
-
-  // ---------------------------------------------------------------------------
-  // WONDERSTAR (Laravel + Capacitor)
-  // ---------------------------------------------------------------------------
-  {
-    slug: 'wonderstar',
-    name: 'Wonderstar app',
-    repo: 'https://github.com/seancreative/app_wonderstar.git',
-    blurb: 'Wonderstar merchant app — Laravel 11 backend + Capacitor mobile client. Similar architecture to qbot-checkin. Backend on VPS, APK distributed to merchants.',
-    domains: ['wonderstar.qbot.now'],
-    reverseProxyPort: '127.0.0.1:8093',
-    start: [
-      COMMON_PUTTY_STEP,
-      {
-        title: 'Clone + .env',
-        cmd: `cd /opt
-git clone https://github.com/seancreative/app_wonderstar.git wonderstar
-cd wonderstar
-cp .env.example .env
-vi .env
-# Required:
-#   APP_URL=https://wonderstar.qbot.now
-#   APP_KEY=              # artisan key:generate --show
-#   DB_PASSWORD=...
-#   VITE_API_URL=https://wonderstar.qbot.now`,
-      },
-      {
-        title: 'First build',
-        cmd: `docker compose -f docker-compose.yml -f docker-compose.vps.yml build --no-cache
-docker compose -f docker-compose.yml -f docker-compose.vps.yml up -d
-docker compose -f docker-compose.yml -f docker-compose.vps.yml exec app php artisan migrate --seed
-docker compose -f docker-compose.yml -f docker-compose.vps.yml exec app php artisan storage:link`,
-      },
-      COMMON_REVERSE_PROXY_STEP('wonderstar.qbot.now', 'WONDERSTAR', '127.0.0.1:8093'),
-    ],
-    dev: [
-      {
-        title: 'Backend + web',
-        cmd: `git clone https://github.com/seancreative/app_wonderstar.git
-cd app_wonderstar
-cp .env.example .env
-docker compose up -d
-docker compose exec app php artisan migrate --seed
-# Open http://localhost:8000`,
-      },
-      {
-        title: 'Android APK (Capacitor)',
-        cmd: `npm install
-npm run build
-npx cap sync android
-cd android
-./gradlew assembleDebug
-# APK: android/app/build/outputs/apk/debug/app-debug.apk`,
-      },
-    ],
-    prod: [
-      {
-        title: 'Deploy',
-        cmd: `cd /opt/wonderstar
-git fetch --all --prune && git reset --hard origin/main
-docker compose -f docker-compose.yml -f docker-compose.vps.yml build --no-cache
-docker compose -f docker-compose.yml -f docker-compose.vps.yml up -d --force-recreate`,
+# Distribute via mobile-dist/ folder or a signed release upload.`,
       },
     ],
     maintenance: [
       {
         title: 'Tail logs',
-        cmd: `cd /opt/wonderstar
-docker compose -f docker-compose.yml -f docker-compose.vps.yml logs --tail 200 -f app`,
+        cmd: `tail -f /opt/qbot-checkin/storage/logs/laravel.log
+journalctl -u qbot-checkin -f --tail 200`,
       },
       {
-        title: 'Storage / uploads not serving',
-        cmd: `docker compose -f docker-compose.yml -f docker-compose.vps.yml exec app php artisan storage:link
-# Verify the symlink:
-docker compose -f docker-compose.yml -f docker-compose.vps.yml exec app ls -l public/storage`,
+        title: 'Switching to php-fpm for real load (recommended before events)',
+        cmd: `cat > /etc/php/8.2/fpm/pool.d/qbot-checkin.conf <<'EOF'
+[qbot-checkin]
+user = www-data
+group = www-data
+listen = /run/php/php8.2-fpm-qbot-checkin.sock
+listen.owner = www-data
+pm = dynamic
+pm.max_children = 20
+pm.start_servers = 4
+pm.min_spare_servers = 2
+pm.max_spare_servers = 8
+EOF
+systemctl restart php8.2-fpm
+
+# Update /opt/reverse-proxy/Caddyfile:
+{$QBOT_CHECKIN_DOMAIN} {
+  root * /opt/qbot-checkin/public
+  php_fastcgi unix//run/php/php8.2-fpm-qbot-checkin.sock
+  file_server
+}
+
+systemctl disable --now qbot-checkin
+cd /opt/reverse-proxy && docker compose up -d --force-recreate caddy`,
+      },
+      {
+        title: 'Mobile app shows "Webpage not available"',
+        cmd: `# 1. Verify DNS + TLS:
+curl -I https://checkin.fisb.qbot.now
+
+# 2. Verify Capacitor server URL:
+grep -A2 server /opt/qbot-checkin/capacitor.config.ts
+
+# 3. Android WebView blocks cleartext HTTP by default — the URL MUST be HTTPS.`,
+      },
+      {
+        title: 'Event-day DB slowness (SQLite locking)',
+        body: 'SQLite serializes writes. During a large event this becomes the bottleneck. Two options:',
+        cmd: `# --- Option A: enable WAL (a big improvement, no schema change) ---
+sqlite3 /opt/qbot-checkin/database/database.sqlite "PRAGMA journal_mode=WAL;"
+
+# --- Option B: migrate to MySQL before the event ---
+apt-get install -y mysql-server
+mysql -e "CREATE DATABASE qbot_checkin; CREATE USER 'checkin'@'localhost' IDENTIFIED BY '...'; GRANT ALL ON qbot_checkin.* TO 'checkin'@'localhost';"
+# Update .env: DB_CONNECTION=mysql etc.
+php artisan migrate --fresh --force   # DESTRUCTIVE — export SQLite first!`,
+      },
+      {
+        title: 'Clear caches after .env / config change',
+        cmd: `cd /opt/qbot-checkin
+php artisan optimize:clear
+php artisan config:cache && php artisan route:cache && php artisan view:cache
+systemctl restart qbot-checkin  # or: systemctl reload php8.2-fpm`,
+      },
+    ],
+  },
+
+  // ---------------------------------------------------------------------------
+  // WONDERSTAR (WonderStars) — static Vite + React + Supabase, NO Docker
+  // ---------------------------------------------------------------------------
+  {
+    slug: 'wonderstar',
+    name: 'Wonderstar app — static SPA',
+    repo: 'https://github.com/seancreative/app_wonderstar.git',
+    blurb: 'Wonderpark family membership + rewards app. Pure Vite + React + TypeScript SPA — all backend logic (auth, orders, wallet, missions, workshops, mystery boxes, RLS) lives in Supabase. NO backend, NO Docker. Builds to a static dist/ folder served by Caddy as a file_server. Fiuu payments go through the aigenius-backend-old proxy.',
+    domains: ['wonderstar.qbot.now'],
+    reverseProxyPort: 'static file_server (no upstream port)',
+    start: [
+      COMMON_PUTTY_STEP,
+      {
+        title: 'Install Node 20 on the VPS (once)',
+        cmd: `curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+apt-get install -y nodejs
+node --version   # v20.x
+npm --version`,
+      },
+      {
+        title: 'Clone + env',
+        cmd: `cd /opt
+git clone https://github.com/seancreative/app_wonderstar.git wonderstar
+cd wonderstar
+
+npm ci
+
+# Vite reads VITE_* from .env at BUILD time (baked into the bundle):
+cat > .env <<'EOF'
+VITE_SUPABASE_URL=https://<project>.supabase.co
+VITE_SUPABASE_ANON_KEY=<anon-public-key>
+VITE_PAYMENT_API_URL=https://api-old.aigenius.now
+VITE_FRONTEND_URL=https://wonderstar.qbot.now
+EOF`,
+        note: 'The anon key is safe to embed — Supabase RLS enforces per-row access on the server. Never put the service_role key in a VITE_ var — that bypasses RLS.',
+      },
+      {
+        title: 'Build the static bundle',
+        cmd: `cd /opt/wonderstar
+npm run build
+# Output: /opt/wonderstar/dist/
+ls -la dist/`,
+      },
+      {
+        title: 'Wire the dist/ folder into /opt/reverse-proxy as a static site',
+        body: 'No upstream port — Caddy serves dist/ directly as a file_server with SPA fallback (all unknown routes → index.html so React Router works).',
+        cmd: `cat >> /opt/reverse-proxy/.env <<'EOF'
+WONDERSTAR_DOMAIN=wonderstar.qbot.now
+WONDERSTAR_ROOT=/opt/wonderstar/dist
+EOF
+
+cat >> /opt/reverse-proxy/Caddyfile <<'EOF'
+
+{$WONDERSTAR_DOMAIN} {
+  root * {$WONDERSTAR_ROOT}
+  encode zstd gzip
+  try_files {path} /index.html
+  file_server
+  header /assets/* Cache-Control "public, max-age=31536000, immutable"
+  header /index.html Cache-Control "no-cache"
+}
+EOF
+
+# Mount /opt/wonderstar into the caddy container. Edit /opt/reverse-proxy/docker-compose.yml
+# and add under caddy.volumes:
+#   - /opt/wonderstar/dist:/opt/wonderstar/dist:ro
+
+cd /opt/reverse-proxy
+docker compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile
+docker compose up -d --force-recreate caddy`,
+        note: 'Static assets get 1-year cache (they have hashed filenames from Vite so browsers refetch after a new build); index.html stays uncached so a new deploy is picked up on the next reload.',
+      },
+    ],
+    dev: [
+      {
+        title: 'Local dev with Vite HMR',
+        cmd: `git clone https://github.com/seancreative/app_wonderstar.git
+cd app_wonderstar
+npm install
+
+# Copy .env for local:
+cat > .env <<'EOF'
+VITE_SUPABASE_URL=https://<project>.supabase.co
+VITE_SUPABASE_ANON_KEY=<anon-key>
+VITE_PAYMENT_API_URL=http://localhost:8000
+VITE_FRONTEND_URL=http://localhost:5173
+EOF
+
+npm run dev
+# → http://localhost:5173`,
+      },
+      {
+        title: 'Type-check + lint',
+        cmd: `npm run typecheck
+npm run lint`,
+      },
+      {
+        title: 'Preview the production bundle locally',
+        cmd: `npm run build
+npm run preview
+# → http://localhost:4173 (serves ./dist same way Caddy will)`,
+      },
+    ],
+    prod: [
+      COMMON_PUTTY_STEP,
+      {
+        title: 'Redeploy (git pull + build)',
+        body: 'Because it\'s a static bundle, "deploy" is just rebuild + Caddy picks it up on the next request (no restart needed — file_server reads from disk).',
+        cmd: `cd /opt/wonderstar
+git fetch --all --prune
+git reset --hard origin/main
+
+npm ci
+npm run build
+
+# Optional: purge Cloudflare / CDN cache if one sits in front.
+# No systemctl restart needed — Caddy serves dist/ from disk.`,
+      },
+      {
+        title: 'Deploy via CI (optional) — GitHub Actions rsync',
+        body: 'For hands-free deploy, add .github/workflows/deploy.yml that runs npm ci + npm run build, then rsyncs dist/ to /opt/wonderstar/dist on the VPS over SSH. Same pattern qrpos/qparking use.',
+      },
+      {
+        title: 'Rollback',
+        cmd: `# Roll back the source, rebuild, done:
+cd /opt/wonderstar
+git log --oneline -20
+git reset --hard <previous-good-sha>
+npm ci && npm run build`,
+      },
+    ],
+    maintenance: [
+      {
+        title: 'Build failed / dist/ is stale after deploy',
+        cmd: `cd /opt/wonderstar
+rm -rf node_modules dist
+npm ci
+npm run build 2>&1 | tail -40
+# If TypeScript errors: npm run typecheck for details`,
+      },
+      {
+        title: 'Users see the old version after deploy',
+        body: 'index.html is served with no-cache; browsers should always fetch it fresh. If they don\'t, a CDN (Cloudflare / etc.) is caching too aggressively.',
+        cmd: `# Verify Caddy is sending no-cache on index.html:
+curl -I https://wonderstar.qbot.now/ | grep -i cache-control
+# Expect:  Cache-Control: no-cache
+
+# If cache-control is wrong, re-check the Caddyfile block for the header directive.`,
+      },
+      {
+        title: 'Blank page in the browser',
+        cmd: `# Open browser devtools → Console tab.
+# Common causes:
+#   - Wrong VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY (bakes into bundle at build time)
+#   - Rebuild after changing .env — Vite vars are BUILD-TIME, not runtime
+cd /opt/wonderstar && npm run build`,
+      },
+      {
+        title: 'Supabase RLS denying reads',
+        body: 'The frontend uses the anon key. RLS policies must allow the anon or authenticated role for every table it reads/writes.',
+        cmd: `# In the Supabase dashboard:
+#   → SQL editor → run: SELECT * FROM pg_policies WHERE tablename = '<table>';
+# Or check the browser Network tab — 401/403 responses reveal the failing policy.`,
+      },
+      {
+        title: 'Payment redirect fails',
+        body: 'wonderstar calls VITE_PAYMENT_API_URL (aigenius-backend-old) for /payments/initiate. If checkout hangs, verify that backend is up.',
+        cmd: `curl -I https://api-old.aigenius.now/health
+# Should return 200. If not, check the aigenius-backend-old docs.`,
       },
     ],
   },

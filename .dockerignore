@@ -1,0 +1,33 @@
+# Never let host artifacts leak into the image — the image builds them fresh.
+# node_modules from a Windows / macOS npm install lacks the +x bit on
+# .bin/* on Linux, which manifests as `sh: vite: Permission denied` (exit 126).
+**/node_modules
+**/dist
+**/build
+
+# VCS / IDE / OS noise
+.git
+.gitignore
+.github
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+
+# Local env — the container reads .env via compose, not COPY
+.env
+.env.*
+!.env.example
+!.env.vps.example
+
+# Logs + tmp
+*.log
+npm-debug.log*
+yarn-debug.log*
+tmp
+temp
+
+# Docs / meta
+README.md
+*.md
+!server/**/*.md
